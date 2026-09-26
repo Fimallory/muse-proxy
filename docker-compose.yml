@@ -1,0 +1,36 @@
+version: "3.4"
+
+services:
+  muse-proxy:
+    build: .
+    image: muse-proxy:local
+    container_name: muse-proxy
+    restart: always
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CONFIG_PATH=/var/lib/muse-proxy/config.json
+      - CONFIG_SEED_PATH=/run/config/muse-proxy.json
+      - LISTEN_ADDRESS=0.0.0.0:3334
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/var/lib/muse-proxy
+      - ./config.json:/run/config/muse-proxy.json:ro
+    tmpfs:
+      - /tmp
+    networks:
+      axonhub-net:
+        aliases:
+          - muse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3334/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  axonhub-net:
+    external: true
+    name: axonhub_axonhub-network

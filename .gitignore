@@ -1,0 +1,24 @@
+# Binaries and build output
+muse-proxy
+muse-proxy.exe
+muse-proxy-test*
+*.test
+*.out
+
+# Local configs (may contain secrets) — copy config.example.json instead
+config.json
+config.test.json
+*.local.json
+
+# Runtime state
+hashes.json
+catalog.json
+data/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

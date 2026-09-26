@@ -1,0 +1,19 @@
+{
+  "listen": "0.0.0.0:8080",
+  "server_keys": ["change-this-local-key"],
+  "zen_key": "oc_sk-your-zen-key",
+  "upstream": "https://opencode.ai/zen",
+  "proxies": ["direct"],
+  "reuse_proxy_connections": false,
+  "prefer_direct": true,
+  "direct_cooldown_seconds": 120,
+  "pool_max_attempts": 3,
+  "hash_store_path": "/var/lib/muse-proxy/hashes.json",
+  "hash_ttl_days": 3,
+  "hash_max_entries": 50000,
+  "hash_prefix_chars": 10000,
+  "catalog_url": "https://models.opencode.ai/api.json",
+  "catalog_path": "/var/lib/muse-proxy/catalog.json",
+  "catalog_refresh_hours": 24,
+  "request_timeout_seconds": 600
+}
