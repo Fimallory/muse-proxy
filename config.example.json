@@ -26,7 +26,7 @@
       "timeout_seconds": 8,
       "concurrency": 48,
       "max_keep": 40,
-      "refresh_hours": 6
+      "refresh_hours": 3
     }
   ],
   "retry_empty": true,
