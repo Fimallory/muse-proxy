@@ -34,6 +34,9 @@ OpenCode 客户端同一份能力目录把每个模型路由到它的**原生协
 - **智能出口**：优先本机直连，429/5xx/传输失败时切代理池；池内每次都建
   新连接（轮转型代理池按连接分配出口，keep-alive 会钉死单节点），ALPN
   钉死 HTTP/1.1
+- **订阅池**：`proxy_sources` 指向纯文本代理列表；每个源在启动时拉取、
+  并发测活、只收录活节点（可定时刷新），死节点永不进入轮转
+- **空回拦截**：无文本、无工具调用的 2xx 一律不透传，内部换新连接重发
 - **可观测**：`GET /healthz`（目录年龄/出口状态/hash 数），
   `x-request-id` / `x-muse-session` 回显头，每请求一行日志
 
@@ -83,6 +86,29 @@ curl http://localhost:8080/v1/chat/completions \
 | `POST` | `/v1/responses` | Responses |
 | `POST` | `/v1/messages` | Anthropic Messages（也接受 `x-api-key`） |
 
+一个源的写法：
+
+```json
+{
+  "url": "https://example.com/proxies.txt",
+  "protocol": "",
+  "test_url": "https://opencode.ai/zen/v1/models",
+  "timeout_seconds": 8,
+  "concurrency": 48,
+  "max_keep": 40,
+  "refresh_hours": 6
+}
+```
+
+- `protocol` 覆盖格式识别（`http`/`https`/`socks5`）；无 scheme 的行
+ （`host:port`、`ip:port:user:pass`）用它，缺省 `http`。
+- `test_url` 会经由每个代理请求一次；除 429/5xx 外任何 HTTP 响应都算活。
+ URL 里的账密（Basic）可直接用。
+- `max_keep` 只保留最快的 N 个（`0` = 全收）。
+- `refresh_hours: 0` 表示只在启动时检查一次。
+- `/healthz` 有每个池的 `sources/live/rejected` 计数；每次刷新整体替换，
+ 死节点不会累积。
+
 ## 配置说明
 
 | 字段 | 默认值 | 含义 |
@@ -96,6 +122,9 @@ curl http://localhost:8080/v1/chat/completions \
 | `prefer_direct` | `true` | 优先本机出口，429/5xx/传输失败时切池 |
 | `direct_cooldown_seconds` | `120` | 429 后直连冷却多久（更大的 `Retry-After` 优先） |
 | `pool_max_attempts` | `3` | 每个请求在池内重试几次（每次都是新连接） |
+| `proxy_sources` | `[]` | 订阅 URL（每行一个代理）；每个源启动时拉取+并发测活（阻塞，最多 3 分钟），只收录活节点 |
+| `retry_empty` | `true` | 空 2xx 不透传，内部重发 |
+| `max_empty_retries` | `2` | 空回的额外内部尝试次数（用完仍把最后一次透传） |
 | `hash_store_path` | `./hashes.json` | 内容 hash→会话映射（只存 hash，0600 权限） |
 | `hash_ttl_days` | `3` | 超过多久没见就清理 |
 | `hash_max_entries` | `50000` | 上限，先淘汰最旧 |

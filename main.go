@@ -42,7 +42,8 @@ func main() {
 
 	cat := openCatalog(cfg.CatalogPath, cfg.CatalogURL, cfg.CatalogRefresh)
 
-	srv, err := newServer(cfg, store, cat)
+	pool := newProxyPool()
+	srv, err := newServer(cfg, store, cat, pool)
 	if err != nil {
 		log.Fatalf("init server: %v", err)
 	}
@@ -64,9 +65,16 @@ func main() {
 	defer appCancel()
 	cat.start(appCtx)
 
+	// Proxy sources are fetched and health-checked before the listener
+	// opens, so the very first real request never walks a dead pool.
+	if len(cfg.ProxySources) > 0 {
+		log.Printf("checking %d proxy source(s) before startup...", len(cfg.ProxySources))
+		waitProxySources(appCtx, cfg, pool, 3*time.Minute)
+	}
+
 	go func() {
-		log.Printf("muse-proxy %s listening on %s (upstream %s, %d proxie(s))",
-			version, cfg.Listen, cfg.Upstream, len(cfg.Proxies))
+		log.Printf("muse-proxy %s listening on %s (upstream %s, pool %d live)",
+			version, cfg.Listen, cfg.Upstream, pool.len())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}

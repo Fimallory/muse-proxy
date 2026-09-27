@@ -254,7 +254,7 @@ func TestFailoverDirect429ToPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.close()
-	srv, err := newServer(cfg, store, openCatalog(t.TempDir()+"/c.json", "http://example.invalid", time.Hour))
+	srv, err := newServer(cfg, store, openCatalog(t.TempDir()+"/c.json", "http://example.invalid", time.Hour), newProxyPool())
 	if err != nil {
 		t.Fatal(err)
 	}

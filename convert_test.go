@@ -359,7 +359,7 @@ func TestServerWiresCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.close()
-	srv, err := newServer(cfg, store, c)
+	srv, err := newServer(cfg, store, c, newProxyPool())
 	if err != nil {
 		t.Fatal(err)
 	}

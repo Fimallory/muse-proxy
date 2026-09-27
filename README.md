@@ -41,6 +41,11 @@ it converts.
   429/5xx/transport errors; pool attempts always dial fresh connections
   (rotating pools assign egress per connection — keep-alive would pin you
   to one node), with ALPN pinned to HTTP/1.1
+- **Subscription pools**: point `proxy_sources` at plaintext proxy lists;
+  every source is fetched, health-checked concurrently and filtered at
+  startup (and on schedule), so dead nodes never enter rotation
+- **Empty-reply guard**: 2xx answers with no text and no tool calls are
+  retried internally on a fresh connection instead of passed through
 - **Observability**: `GET /healthz` (catalog age, egress state, hash count),
   `x-request-id` / `x-muse-session` echo headers, one log line per request
 
@@ -92,6 +97,30 @@ checks need no authentication.
 | `POST` | `/v1/responses` | Responses |
 | `POST` | `/v1/messages` | Anthropic Messages (`x-api-key` also accepted) |
 
+A source entry:
+
+```json
+{
+  "url": "https://example.com/proxies.txt",
+  "protocol": "",
+  "test_url": "https://opencode.ai/zen/v1/models",
+  "timeout_seconds": 8,
+  "concurrency": 48,
+  "max_keep": 40,
+  "refresh_hours": 6
+}
+```
+
+- `protocol` overrides scheme detection (`http`/`https`/`socks5`);
+  scheme-less lines (`host:port`, `ip:port:user:pass`) default to it
+  (`http` when unset).
+- `test_url` is fetched through each proxy; any HTTP response except
+  429/5xx counts as alive. Basic/digest proxy credentials in the URL work.
+- `max_keep` keeps the fastest N nodes (`0` = all live ones).
+- `refresh_hours: 0` means check once at startup only.
+- `/healthz` reports per-pool `sources/live/rejected` counters; dead
+  nodes are replaced wholesale on every refresh, never accumulated.
+
 ## Configuration reference
 
 | Field | Default | Meaning |
@@ -105,6 +134,9 @@ checks need no authentication.
 | `prefer_direct` | `true` | try local egress first, fail over to pool on 429/5xx/transport errors |
 | `direct_cooldown_seconds` | `120` | skip direct this long after a 429 (honors larger `Retry-After`) |
 | `pool_max_attempts` | `3` | retries through the pool per request (each a fresh connection) |
+| `proxy_sources` | `[]` | subscription URLs (one proxy per line); each source is fetched + health-checked at startup (blocking, max 3 min) and only live proxies join the pool |
+| `retry_empty` | `true` | drop empty 2xx replies instead of forwarding them; re-send internally |
+| `max_empty_retries` | `2` | extra internal attempts for empty replies (last reply forwarded even if empty) |
 | `hash_store_path` | `./hashes.json` | content-hash → session/project map (hashes only, mode 0600) |
 | `hash_ttl_days` | `3` | entries unseen this long are purged |
 | `hash_max_entries` | `50000` | cap; stalest evicted first |

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -31,8 +33,54 @@ var hopHeaders = map[string]bool{
 }
 
 type proxyTransport struct {
-	name   string
-	client *http.Client
+	name    string
+	client  *http.Client
+	latency time.Duration
+}
+
+// newForwardTransport builds an egress transport for one proxy URL.
+// testURL is only used to pick sane timeouts; it is not contacted here.
+func newForwardTransport(raw, testURL string) (*http.Transport, error) {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if raw == "direct" {
+		tr.Proxy = nil
+		return tr, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("parse proxy %q: %w", raw, err)
+	}
+	tr.Proxy = http.ProxyURL(u)
+	// A rotating pool assigns an egress node per connection, so a pooled
+	// keep-alive tunnel would pin every request to one node. HTTP/2
+	// multiplexes too, so it goes as well, and ALPN is pinned to
+	// http/1.1 or the server answers with h2 frames on an h1 connection
+	// (malformed response).
+	tr.DisableKeepAlives = true
+	tr.ForceAttemptHTTP2 = false
+	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	tlsCfg := tr.TLSClientConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	} else {
+		tlsCfg = tlsCfg.Clone()
+	}
+	tlsCfg.NextProtos = []string{"http/1.1"}
+	tr.TLSClientConfig = tlsCfg
+	tr.MaxIdleConns = 0
+	tr.MaxIdleConnsPerHost = 0
+	return tr, nil
 }
 
 // Server is the forwarding gateway.
@@ -40,95 +88,60 @@ type Server struct {
 	cfg      *Config
 	store    *hashStore
 	catalog  *catalog
+	pool     *proxyPool
 	direct   *proxyTransport
-	pools    []*proxyTransport
-	legacy   []*proxyTransport // prefer_direct=false: round-robin over all
 	rr       atomic.Uint64
 	banUntil atomic.Int64 // direct egress skipped while now < banUntil
 }
 
-func newServer(cfg *Config, store *hashStore, cat *catalog) (*Server, error) {
-	s := &Server{cfg: cfg, store: store, catalog: cat}
-	mkTransport := func(raw string) (*proxyTransport, error) {
-		tr := &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   100,
-			IdleConnTimeout:       90 * time.Second,
-			ForceAttemptHTTP2:     true,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-		if raw == "direct" {
-			tr.Proxy = nil
-		} else {
-			u, err := url.Parse(raw)
-			if err != nil {
-				return nil, err
-			}
-			tr.Proxy = http.ProxyURL(u)
-		}
-		if raw != "direct" && !cfg.ReuseProxyConns {
-			// A rotating pool assigns an egress node per connection, so a
-			// pooled keep-alive tunnel would pin every request to one node.
-			// HTTP/2 multiplexes too, so it goes as well, and ALPN is pinned
-			// to http/1.1 or the server answers with h2 frames on an h1
-			// connection (malformed response).
-			tr.DisableKeepAlives = true
-			tr.ForceAttemptHTTP2 = false
-			tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-			tlsCfg := tr.TLSClientConfig
-			if tlsCfg == nil {
-				tlsCfg = &tls.Config{}
-			} else {
-				tlsCfg = tlsCfg.Clone()
-			}
-			tlsCfg.NextProtos = []string{"http/1.1"}
-			tr.TLSClientConfig = tlsCfg
-			tr.MaxIdleConns = 0
-			tr.MaxIdleConnsPerHost = 0
-		}
-		return &proxyTransport{name: raw, client: &http.Client{Transport: tr}}, nil
-	}
+func newServer(cfg *Config, store *hashStore, cat *catalog, pool *proxyPool) (*Server, error) {
+	s := &Server{cfg: cfg, store: store, catalog: cat, pool: pool}
 	if cfg.PreferDirect {
-		d, err := mkTransport("direct")
+		tr, err := newForwardTransport("direct", "")
 		if err != nil {
 			return nil, err
 		}
-		s.direct = d
+		s.direct = &proxyTransport{name: "direct", client: &http.Client{Transport: tr}}
+	}
+	// Static inline proxies (reuse_proxy_connections) become their own
+	// tiny pool unless proxy_sources already supply a dynamic one.
+	if pool == nil {
+		pool = newProxyPool()
+	}
+	if pool.len() == 0 {
+		var static []*proxyTransport
 		for _, raw := range cfg.Proxies {
 			if raw == "direct" {
 				continue
 			}
-			t, err := mkTransport(raw)
+			tr, err := newForwardTransport(raw, "")
 			if err != nil {
 				return nil, err
 			}
-			s.pools = append(s.pools, t)
+			if cfg.ReuseProxyConns {
+				tr.DisableKeepAlives = false
+				tr.ForceAttemptHTTP2 = true
+				tr.TLSNextProto = nil
+				tr.MaxIdleConns = 64
+				tr.MaxIdleConnsPerHost = 64
+				tlsCfg := tr.TLSClientConfig
+				if tlsCfg != nil {
+					tlsCfg = tlsCfg.Clone()
+					tlsCfg.NextProtos = nil
+					tr.TLSClientConfig = tlsCfg
+				}
+			}
+			static = append(static, &proxyTransport{name: raw, client: &http.Client{Transport: tr}})
 		}
-	} else {
-		for _, raw := range cfg.Proxies {
-			t, err := mkTransport(raw)
-			if err != nil {
-				return nil, err
-			}
-			s.legacy = append(s.legacy, t)
+		if len(static) > 0 {
+			pool.replace(static)
 		}
 	}
+	s.pool = pool
 	return s, nil
 }
 
 func (s *Server) close() {}
-
-func (s *Server) pickPool() *proxyTransport {
-	if len(s.pools) == 1 {
-		return s.pools[0]
-	}
-	return s.pools[int(s.rr.Add(1))%len(s.pools)]
-}
 
 // deterministic4xx reports request shapes the upstream will always reject
 // regardless of egress: retrying them through another route cannot help.
@@ -215,7 +228,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	egress := map[string]any{"prefer_direct": s.cfg.PreferDirect}
 	if s.cfg.PreferDirect {
 		egress["direct_banned"] = time.Now().UnixNano() < s.banUntil.Load()
-		egress["pool_routes"] = len(s.pools)
+	}
+	if st := s.pool.stats(); st.Sources > 0 || st.Live > 0 {
+		egress["pool"] = st
 	}
 	entries, updated, source := s.catalog.snapshot()
 	writeJSON(w, 200, map[string]any{
@@ -413,8 +428,9 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 
 // forwardProto sends the request upstream in the native protocol and
 // relays the response back in the client protocol, converting when they
-// differ. Streaming responses are transcoded live; collapse mode folds
-// the stream into a single JSON object for stream:false clients.
+// differ. Responses are buffered, verified non-empty (retried internally
+// when blank), then delivered: collapsed to JSON for stream:false
+// clients, relayed or transcoded for streaming ones.
 func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, client Protocol, body []byte, extra map[string]string, rid, session, project, model string, collapse bool) {
 	upPath := native.Path()
 	if upPath == "" {
@@ -430,27 +446,31 @@ func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, cl
 	if native != client {
 		conv = string(native) + "->" + string(client) + " "
 	}
-	resp, err := s.roundTrip(ctx, r, upPath, body, extra)
+	res, err := s.fetchVerified(ctx, r, upPath, body, extra, native, model)
 	if err != nil {
 		log.Printf("upstream %s %s error: %v", r.Method, upPath, err)
 		writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed"}})
 		return
 	}
-	defer resp.Body.Close()
 
-	if collapse && resp.StatusCode/100 == 2 {
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, collapseMaxBytes))
-		if err != nil {
-			writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "read upstream stream"}})
-			return
-		}
+	if res.status/100 != 2 {
+		w.Header().Set("Content-Type", "application/json")
+		setEchoHeaders(w, rid, session, project)
+		w.WriteHeader(res.status)
+		_, _ = w.Write(res.body)
+		log.Printf("%s %s -> %d %s%dms sess=%s", r.Method, upPath,
+			res.status, conv, time.Since(start).Milliseconds(), shortID(session))
+		return
+	}
+
+	if collapse {
 		var out []byte
 		var status int
 		if native == client && native == ProtoResponses {
 			// Verbatim completed object: highest fidelity.
-			out, status = collapseSSE(raw, model, "")
+			out, status = collapseSSE(res.body, model, "")
 		} else {
-			events := parseSSEEvents(native, raw)
+			events := parseSSEEvents(native, res.body)
 			out = eventsToResponseJSON(client, events, model)
 			status = 200
 		}
@@ -464,11 +484,33 @@ func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, cl
 	}
 
 	if native == client {
-		s.relayStream(w, r, resp, upPath, start, rid, session, project, "")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Content-Length", strconv.FormatInt(int64(len(res.body)), 10))
+		setEchoHeaders(w, rid, session, project)
+		w.WriteHeader(res.status)
+		_, _ = w.Write(res.body)
+		log.Printf("%s %s -> %d %dB %dms sess=%s", r.Method, upPath,
+			res.status, len(res.body), time.Since(start).Milliseconds(), shortID(session))
 		return
 	}
-	// Cross-protocol stream: transcode live.
-	s.transcodeStream(w, r, resp, native, client, model, upPath, start, rid, session, project)
+	// Cross-protocol: transcode the verified bytes, then deliver.
+	tc := newTranscoder(client, model)
+	var out []byte
+	for _, ue := range parseSSEEvents(native, res.body) {
+		out = append(out, tc.push(ue)...)
+	}
+	out = append(out, tc.flush()...)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(out)), 10))
+	setEchoHeaders(w, rid, session, project)
+	w.WriteHeader(res.status)
+	_, _ = w.Write(out)
+	log.Printf("%s %s -> %d %s%dB live %dms sess=%s", r.Method, upPath,
+		res.status, conv, len(out), time.Since(start).Milliseconds(), shortID(session))
 }
 
 // forward serves the models path (same-protocol GET relay).
@@ -499,92 +541,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, resp *http.
 		time.Since(start).Milliseconds(), shortID(session))
 }
 
-// transcodeStream converts a foreign-protocol SSE stream into the client
-// protocol incrementally, flushing converted frames as they arrive.
-func (s *Server) transcodeStream(w http.ResponseWriter, r *http.Request, resp *http.Response, native, client Protocol, model, upPath string, start time.Time, rid, session, project string) {
-	tc := newTranscoder(client, model)
-	ct := "text/event-stream"
-	if client == ProtoChat || client == ProtoResponses || client == ProtoMessages {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	setEchoHeaders(w, rid, session, project)
-	w.WriteHeader(resp.StatusCode)
-	fl, _ := w.(http.Flusher)
-
-	var pending []byte
-	buf := make([]byte, 32*1024)
-	flushOut := func(b []byte) bool {
-		if len(b) == 0 {
-			return true
-		}
-		if _, err := w.Write(b); err != nil {
-			return false
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return true
-	}
-	for {
-		n, er := resp.Body.Read(buf)
-		if n > 0 {
-			chunk := bytes.ReplaceAll(buf[:n], []byte("\r\n"), []byte("\n"))
-			pending = append(pending, chunk...)
-			// Carve out complete frames; keep the tail buffered.
-			for {
-				idx := bytes.Index(pending, []byte("\n\n"))
-				if idx < 0 {
-					break
-				}
-				frame := pending[:idx]
-				pending = pending[idx+2:]
-				data := frameData(frame)
-				if data == "" || data == "[DONE]" {
-					continue
-				}
-				var ev map[string]any
-				if err := json.Unmarshal([]byte(data), &ev); err != nil {
-					continue
-				}
-				for _, ue := range parseOneEvent(native, ev) {
-					if out := tc.push(ue); !flushOut(out) {
-						return
-					}
-				}
-			}
-		}
-		if er != nil {
-			break
-		}
-	}
-	// Upstream ended: emit any held terminal event. A stream that ended
-	// without one gets a synthesized stop so the client never hangs.
-	if !tc.finished && tc.pendingDone == nil {
-		tc.push(uevent{kind: "done", stop: "stop"})
-	}
-	if out := tc.flush(); out != nil {
-		flushOut(out)
-	}
-	log.Printf("%s %s -> %d %s->%s live %dms sess=%s", r.Method, upPath, resp.StatusCode,
-		native, client, time.Since(start).Milliseconds(), shortID(session))
-}
-
-// parseOneEvent parses a single already-decoded SSE data object.
-func parseOneEvent(from Protocol, ev map[string]any) []uevent {
-	switch from {
-	case ProtoResponses:
-		return parseResponsesEvent(ev)
-	case ProtoMessages:
-		return parseMessagesEvent(ev)
-	default:
-		return parseChatEvent(ev)
-	}
-}
-
+// setEchoHeaders writes the correlation headers every response carries.
 func setEchoHeaders(w http.ResponseWriter, rid, session, project string) {
 	if rid != "" {
 		w.Header().Set("x-request-id", rid)
@@ -624,13 +581,44 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		return req, nil
 	}
 
+	if s.pool.len() == 0 && s.direct == nil {
+		return nil, fmt.Errorf("no egress route configured (no proxies live, direct disabled)")
+	}
+
+	// Pool-only mode: no direct route to prefer.
 	if !s.cfg.PreferDirect {
-		t := s.legacy[int(s.rr.Add(1))%len(s.legacy)]
-		req, err := build()
-		if err != nil {
-			return nil, err
+		attempts := s.cfg.PoolMaxAttempts
+		if attempts < 1 {
+			attempts = 1
 		}
-		return t.client.Do(req)
+		var lastErr error
+		for i := 0; i < attempts; i++ {
+			t := s.pool.next()
+			if t == nil {
+				break
+			}
+			req, err := build()
+			if err != nil {
+				return nil, err
+			}
+			resp, err := t.client.Do(req)
+			if err == nil && (resp.StatusCode/100 == 2 || deterministic4xx(resp.StatusCode)) {
+				return resp, nil
+			}
+			if i < attempts-1 {
+				closeResp(resp)
+				lastErr = err
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("proxy pool is empty")
+		}
+		return nil, lastErr
 	}
 
 	if time.Now().UnixNano() >= s.banUntil.Load() && s.direct != nil {
@@ -645,11 +633,11 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		if err != nil || shouldFailover(resp.StatusCode, nil) {
 			s.banDirect(resp, err)
 		}
-		if err == nil && len(s.pools) == 0 {
+		if err == nil && s.pool.len() == 0 {
 			return resp, nil
 		}
 		closeResp(resp)
-		if err != nil && len(s.pools) == 0 {
+		if err != nil && s.pool.len() == 0 {
 			return nil, err
 		}
 	}
@@ -659,9 +647,12 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		attempts = 1
 	}
 	var lastErr error
-	for i := 0; i < attempts && len(s.pools) > 0; i++ {
+	for i := 0; i < attempts && s.pool.len() > 0; i++ {
 		last := i == attempts-1
-		t := s.pickPool()
+		t := s.pool.next()
+		if t == nil {
+			break
+		}
 		req, err := build()
 		if err != nil {
 			return nil, err
@@ -681,7 +672,87 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		}
 		return resp, nil
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all egress routes failed")
+	}
 	return nil, lastErr
+}
+
+// waitProxySources runs the first fetch+check round for all sources and
+// blocks until each has either installed a pool or failed. The listener
+// opens afterwards so the first request sees a verified pool.
+func waitProxySources(ctx context.Context, cfg *Config, pool *proxyPool, maxWait time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		pool.sourceCount.Store(int64(len(cfg.ProxySources)))
+		for i := range cfg.ProxySources {
+			src := cfg.ProxySources[i]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runProxySourceOnce(ctx, src, pool)
+			}()
+		}
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(maxWait):
+		log.Printf("proxy check still running after %s; starting listener anyway", maxWait)
+	}
+	// Periodic refresh for sources that asked for it.
+	for i := range cfg.ProxySources {
+		src := cfg.ProxySources[i]
+		if src.RefreshHours <= 0 {
+			continue
+		}
+		go runProxySourceLoop(ctx, src, pool)
+	}
+}
+
+// runProxySourceOnce performs one fetch + check + install round.
+func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool) {
+	start := time.Now()
+	raw, err := fetchProxyList(ctx, src)
+	if err != nil {
+		log.Printf("proxy source %s: fetch failed: %v", redactProxySource(src.URL), err)
+		return
+	}
+	pool.lastFetch.Store(time.Now().Unix())
+	if len(raw) == 0 {
+		log.Printf("proxy source %s: empty list, keeping previous pool", redactProxySource(src.URL))
+		return
+	}
+	live, tested, dead := checkProxyList(ctx, raw, src)
+	pool.lastChecked.Store(time.Now().Unix())
+	pool.deadCount.Store(int64(dead))
+	if len(live) == 0 {
+		log.Printf("proxy source %s: %d checked, none alive", redactProxySource(src.URL), tested)
+		return
+	}
+	if src.MaxKeep > 0 && len(live) > src.MaxKeep {
+		// Probes are sorted by latency; keep the fastest MaxKeep nodes.
+		live = live[:src.MaxKeep]
+	}
+	pool.replace(live)
+	log.Printf("proxy source %s: %d checked -> %d live, %d rejected in %s",
+		redactProxySource(src.URL), tested, len(live), dead, time.Since(start).Round(time.Millisecond))
+}
+
+// runProxySourceLoop re-runs the fetch+check round on schedule.
+func runProxySourceLoop(ctx context.Context, src ProxySource, pool *proxyPool) {
+	ticker := time.NewTicker(time.Duration(src.RefreshHours * float64(time.Hour)))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runProxySourceOnce(ctx, src, pool)
+		}
+	}
 }
 
 func shortID(s string) string {
