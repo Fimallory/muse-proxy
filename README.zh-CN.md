@@ -127,7 +127,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `proxy_sources` | `[]` | 订阅 URL（每行一个代理）；每个源启动时拉取+并发测活（阻塞，最多 3 分钟），只收录活节点 |
 | `retry_empty` | `true` | 空 2xx 不透传，内部重发 |
 | `max_empty_retries` | `2` | 空回的额外内部尝试次数（用完仍把最后一次透传） |
-| `empty_guard_timeout_seconds` | `10` | 流式回包在"判定是否为空"期间最多被扣留多久；超时即冲刷已扣留的前缀并转为实时流（`0` = 等到出现内容或流结束） |
+| `empty_guard_timeout_seconds` | `30` | 流式回包在"判定是否为空"期间最多被扣留多久；超时即冲刷已扣留的前缀并转为实时流（`0` = 等到出现内容或流结束） |
 | `hash_store_path` | `./hashes.json` | 内容 hash→会话映射（只存 hash，0600 权限） |
 | `hash_ttl_days` | `3` | 超过多久没见就清理 |
 | `hash_max_entries` | `50000` | 上限，先淘汰最旧 |

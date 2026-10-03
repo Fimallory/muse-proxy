@@ -31,6 +31,6 @@
   ],
   "retry_empty": true,
   "max_empty_retries": 2,
-  "empty_guard_timeout_seconds": 10,
+  "empty_guard_timeout_seconds": 30,
   "request_timeout_seconds": 600
 }

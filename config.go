@@ -51,7 +51,7 @@ type Config struct {
 	// held back while the empty-reply guard decides whether it carries
 	// content. On expiry the held prefix is flushed and the stream goes
 	// live, so a slow first token can never stall the client. 0 waits
-	// until content arrives or the stream ends. Default 10.
+	// until content arrives or the stream ends. Default 30.
 	EmptyGuardTimeoutSeconds int `json:"empty_guard_timeout_seconds"`
 
 	RequestTimeoutSeconds int `json:"request_timeout_seconds"`
@@ -112,7 +112,7 @@ func loadConfig(path string) (*Config, error) {
 		CatalogRefreshHours:      24,
 		RetryEmpty:               true,
 		MaxEmptyRetries:          2,
-		EmptyGuardTimeoutSeconds: 10,
+		EmptyGuardTimeoutSeconds: 30,
 		RequestTimeoutSeconds:    600,
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))
