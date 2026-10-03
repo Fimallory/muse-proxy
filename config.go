@@ -47,12 +47,20 @@ type Config struct {
 	RetryEmpty      bool `json:"retry_empty"`
 	MaxEmptyRetries int  `json:"max_empty_retries"`
 
+	// EmptyGuardTimeoutSeconds bounds how long a streaming reply may be
+	// held back while the empty-reply guard decides whether it carries
+	// content. On expiry the held prefix is flushed and the stream goes
+	// live, so a slow first token can never stall the client. 0 waits
+	// until content arrives or the stream ends. Default 10.
+	EmptyGuardTimeoutSeconds int `json:"empty_guard_timeout_seconds"`
+
 	RequestTimeoutSeconds int `json:"request_timeout_seconds"`
 
 	HashTTL        time.Duration `json:"-"`
 	RequestTimeout time.Duration `json:"-"`
 	DirectCooldown time.Duration `json:"-"`
 	CatalogRefresh time.Duration `json:"-"`
+	EmptyGuardHold time.Duration `json:"-"`
 }
 
 // ProxySource is one subscription endpoint plus its health-check policy.
@@ -89,22 +97,23 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	cfg := Config{
-		Listen:                "127.0.0.1:3334",
-		Upstream:              "https://opencode.ai/zen",
-		Proxies:               []string{"direct"},
-		PreferDirect:          true,
-		DirectCooldownSeconds: 120,
-		PoolMaxAttempts:       3,
-		HashStorePath:         "./hashes.json",
-		HashTTLDays:           3,
-		HashMaxEntries:        50000,
-		HashPrefixChars:       10000,
-		CatalogURL:            "https://models.opencode.ai/api.json",
-		CatalogPath:           "./catalog.json",
-		CatalogRefreshHours:   24,
-		RetryEmpty:            true,
-		MaxEmptyRetries:       2,
-		RequestTimeoutSeconds: 600,
+		Listen:                   "127.0.0.1:3334",
+		Upstream:                 "https://opencode.ai/zen",
+		Proxies:                  []string{"direct"},
+		PreferDirect:             true,
+		DirectCooldownSeconds:    120,
+		PoolMaxAttempts:          3,
+		HashStorePath:            "./hashes.json",
+		HashTTLDays:              3,
+		HashMaxEntries:           50000,
+		HashPrefixChars:          10000,
+		CatalogURL:               "https://models.opencode.ai/api.json",
+		CatalogPath:              "./catalog.json",
+		CatalogRefreshHours:      24,
+		RetryEmpty:               true,
+		MaxEmptyRetries:          2,
+		EmptyGuardTimeoutSeconds: 10,
+		RequestTimeoutSeconds:    600,
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
@@ -178,6 +187,9 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.MaxEmptyRetries < 0 {
 		return nil, fmt.Errorf("max_empty_retries must not be negative")
 	}
+	if cfg.EmptyGuardTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("empty_guard_timeout_seconds must not be negative")
+	}
 	for i := range cfg.ProxySources {
 		src := &cfg.ProxySources[i]
 		src.URL = strings.TrimSpace(src.URL)
@@ -223,6 +235,7 @@ func loadConfig(path string) (*Config, error) {
 	cfg.RequestTimeout = time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 	cfg.DirectCooldown = time.Duration(cfg.DirectCooldownSeconds) * time.Second
 	cfg.CatalogRefresh = time.Duration(cfg.CatalogRefreshHours * float64(time.Hour))
+	cfg.EmptyGuardHold = time.Duration(cfg.EmptyGuardTimeoutSeconds) * time.Second
 	return &cfg, nil
 }
 

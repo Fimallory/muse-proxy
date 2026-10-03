@@ -452,16 +452,21 @@ func parseSSEEvents(from Protocol, body []byte) []uevent {
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
 		}
-		switch from {
-		case ProtoResponses:
-			out = append(out, parseResponsesEvent(ev)...)
-		case ProtoMessages:
-			out = append(out, parseMessagesEvent(ev)...)
-		default:
-			out = append(out, parseChatEvent(ev)...)
-		}
+		out = append(out, parseOneEvent(from, ev)...)
 	}
 	return out
+}
+
+// parseOneEvent parses a single already-decoded SSE data object.
+func parseOneEvent(from Protocol, ev map[string]any) []uevent {
+	switch from {
+	case ProtoResponses:
+		return parseResponsesEvent(ev)
+	case ProtoMessages:
+		return parseMessagesEvent(ev)
+	default:
+		return parseChatEvent(ev)
+	}
 }
 
 func parseChatEvent(ev map[string]any) []uevent {

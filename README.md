@@ -45,7 +45,10 @@ it converts.
   every source is fetched, health-checked concurrently and filtered at
   startup (and on schedule), so dead nodes never enter rotation
 - **Empty-reply guard**: 2xx answers with no text and no tool calls are
-  retried internally on a fresh connection instead of passed through
+  retried internally on a fresh connection instead of passed through.
+  Streaming stays live: only the prefix is held, and it is flushed as
+  soon as real content (or the hold deadline) arrives, so the client
+  keeps receiving first events promptly.
 - **Observability**: `GET /healthz` (catalog age, egress state, hash count),
   `x-request-id` / `x-muse-session` echo headers, one log line per request
 
@@ -137,6 +140,7 @@ A source entry:
 | `proxy_sources` | `[]` | subscription URLs (one proxy per line); each source is fetched + health-checked at startup (blocking, max 3 min) and only live proxies join the pool |
 | `retry_empty` | `true` | drop empty 2xx replies instead of forwarding them; re-send internally |
 | `max_empty_retries` | `2` | extra internal attempts for empty replies (last reply forwarded even if empty) |
+| `empty_guard_timeout_seconds` | `10` | how long a streaming reply may be held while deciding it is non-empty; on expiry the held prefix is flushed and the stream goes live (`0` = wait for content or stream end) |
 | `hash_store_path` | `./hashes.json` | content-hash → session/project map (hashes only, mode 0600) |
 | `hash_ttl_days` | `3` | entries unseen this long are purged |
 | `hash_max_entries` | `50000` | cap; stalest evicted first |

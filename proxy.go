@@ -428,9 +428,9 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 
 // forwardProto sends the request upstream in the native protocol and
 // relays the response back in the client protocol, converting when they
-// differ. Responses are buffered, verified non-empty (retried internally
-// when blank), then delivered: collapsed to JSON for stream:false
-// clients, relayed or transcoded for streaming ones.
+// differ. Non-streaming (collapse) clients get the stream folded into a
+// single JSON object; streaming clients get a live relay with the
+// empty-reply guard applied.
 func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, client Protocol, body []byte, extra map[string]string, rid, session, project, model string, collapse bool) {
 	upPath := native.Path()
 	if upPath == "" {
@@ -446,24 +446,25 @@ func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, cl
 	if native != client {
 		conv = string(native) + "->" + string(client) + " "
 	}
-	res, err := s.fetchVerified(ctx, r, upPath, body, extra, native, model)
-	if err != nil {
-		log.Printf("upstream %s %s error: %v", r.Method, upPath, err)
-		writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed"}})
-		return
-	}
-
-	if res.status/100 != 2 {
-		w.Header().Set("Content-Type", "application/json")
-		setEchoHeaders(w, rid, session, project)
-		w.WriteHeader(res.status)
-		_, _ = w.Write(res.body)
-		log.Printf("%s %s -> %d %s%dms sess=%s", r.Method, upPath,
-			res.status, conv, time.Since(start).Milliseconds(), shortID(session))
-		return
-	}
 
 	if collapse {
+		// A stream:false client cannot tell liveness from events, so the
+		// answer is buffered, verified non-empty, folded to JSON.
+		res, err := s.fetchVerified(ctx, r, upPath, body, extra, native, model)
+		if err != nil {
+			log.Printf("upstream %s %s error: %v", r.Method, upPath, err)
+			writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed"}})
+			return
+		}
+		if res.status/100 != 2 {
+			w.Header().Set("Content-Type", "application/json")
+			setEchoHeaders(w, rid, session, project)
+			w.WriteHeader(res.status)
+			_, _ = w.Write(res.body)
+			log.Printf("%s %s -> %d %s%dms sess=%s", r.Method, upPath,
+				res.status, conv, time.Since(start).Milliseconds(), shortID(session))
+			return
+		}
 		var out []byte
 		var status int
 		if native == client && native == ProtoResponses {
@@ -483,34 +484,70 @@ func (s *Server) forwardProto(w http.ResponseWriter, r *http.Request, native, cl
 		return
 	}
 
-	if native == client {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.Header().Set("Content-Length", strconv.FormatInt(int64(len(res.body)), 10))
-		setEchoHeaders(w, rid, session, project)
-		w.WriteHeader(res.status)
-		_, _ = w.Write(res.body)
-		log.Printf("%s %s -> %d %dB %dms sess=%s", r.Method, upPath,
-			res.status, len(res.body), time.Since(start).Milliseconds(), shortID(session))
-		return
+	s.forwardStreaming(ctx, w, r, upPath, body, extra, native, client, model, start, conv, rid, session, project)
+}
+
+// forwardStreaming relays a streaming reply live, retrying an empty one
+// internally on a fresh connection. The empty-reply guard holds the
+// response prefix only until it is proven non-empty (or the hold
+// deadline passes), so the client keeps seeing first events promptly.
+func (s *Server) forwardStreaming(ctx context.Context, w http.ResponseWriter, r *http.Request, upPath string, body []byte, extra map[string]string, native, client Protocol, model string, start time.Time, conv, rid, session, project string) {
+	tries := 1
+	if s.cfg.RetryEmpty {
+		tries += s.cfg.MaxEmptyRetries
 	}
-	// Cross-protocol: transcode the verified bytes, then deliver.
-	tc := newTranscoder(client, model)
-	var out []byte
-	for _, ue := range parseSSEEvents(native, res.body) {
-		out = append(out, tc.push(ue)...)
+	var lastErr error
+	for i := 0; i < tries; i++ {
+		force := i == tries-1
+		resp, err := s.roundTrip(ctx, r, upPath, body, extra)
+		if err != nil {
+			lastErr = err
+			if force {
+				break
+			}
+			continue
+		}
+		if resp.StatusCode/100 != 2 {
+			// Errors are never retried: relay them verbatim.
+			copyHeaderStrip(w.Header(), resp.Header)
+			w.Header().Del("Content-Length")
+			setEchoHeaders(w, rid, session, project)
+			w.WriteHeader(resp.StatusCode)
+			streamCopy(w, resp.Body)
+			resp.Body.Close()
+			log.Printf("%s %s -> %d %s%dms sess=%s", r.Method, upPath, resp.StatusCode,
+				conv, time.Since(start).Milliseconds(), shortID(session))
+			return
+		}
+		committed, empty, serr := s.streamGuarded(w, resp, native, client, model, upPath,
+			start, rid, session, project, force)
+		resp.Body.Close()
+		if committed {
+			note := ""
+			if empty {
+				note = "empty "
+			}
+			log.Printf("%s %s -> %d %s%s%dms sess=%s", r.Method, upPath, resp.StatusCode,
+				conv, note, time.Since(start).Milliseconds(), shortID(session))
+			return
+		}
+		if serr != nil {
+			lastErr = serr
+		}
+		if force {
+			break
+		}
+		if empty {
+			log.Printf("empty %s reply for %s, retrying internally (%d/%d)", native, model, i+1, tries)
+		} else {
+			log.Printf("stream %s %s attempt %d/%d failed: %v", r.Method, upPath, i+1, tries, serr)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	out = append(out, tc.flush()...)
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(out)), 10))
-	setEchoHeaders(w, rid, session, project)
-	w.WriteHeader(res.status)
-	_, _ = w.Write(out)
-	log.Printf("%s %s -> %d %s%dB live %dms sess=%s", r.Method, upPath,
-		res.status, conv, len(out), time.Since(start).Milliseconds(), shortID(session))
+	if lastErr != nil {
+		log.Printf("upstream %s %s error: %v", r.Method, upPath, lastErr)
+	}
+	writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed"}})
 }
 
 // forward serves the models path (same-protocol GET relay).
