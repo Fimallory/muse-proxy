@@ -1,15 +1,104 @@
 package main
 
+import "strings"
+
 // reshape.go patches request tool definitions in place, in whatever
 // protocol shape the payload uses:
 //   - client-declared tools always win (priority), but every tool is
 //     guaranteed a parameters schema (missing ones are filled in),
 //   - non-object entries are dropped,
 //   - synthetic definitions are appended for any missing core tool name
-//     so the request still reads as an agent session upstream.
+//     so the request still reads as an agent session upstream,
+//   - the conversation-title request (opencode's title generator) is the
+//     one exception: the Zen free tier only serves it with NO tools, so
+//     its tools are dropped entirely instead of synthesized.
 //
 // Only the tools array is touched; everything else (images, reasoning
 // knobs, history) is left exactly as the client sent it.
+
+// systemText concatenates every system-ish instruction in the payload:
+// the Responses "instructions" string, an Anthropic "system" string or
+// block array, and any system/developer entry in messages or input.
+func systemText(p map[string]any) string {
+	var sb strings.Builder
+	if s, ok := p["instructions"].(string); ok {
+		sb.WriteString(s)
+		sb.WriteByte('\n')
+	}
+	switch s := p["system"].(type) {
+	case string:
+		sb.WriteString(s)
+		sb.WriteByte('\n')
+	case []any:
+		for _, b := range s {
+			if bm, ok := b.(map[string]any); ok {
+				sb.WriteString(mstr(bm, "text"))
+				sb.WriteByte('\n')
+			}
+		}
+	}
+	for _, key := range []string{"messages", "input"} {
+		for _, it := range marr(p, key) {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role := mstr(m, "role"); role != "system" && role != "developer" {
+				continue
+			}
+			switch c := m["content"].(type) {
+			case string:
+				sb.WriteString(c)
+				sb.WriteByte('\n')
+			case []any:
+				for _, part := range c {
+					if pm, ok := part.(map[string]any); ok {
+						sb.WriteString(mstr(pm, "text"))
+						sb.WriteByte('\n')
+					}
+				}
+			}
+		}
+	}
+	return sb.String()
+}
+
+// titleGenNeedles identify opencode's conversation-title prompt. That
+// request deliberately carries no tools, and the Zen free tier only
+// accepts a tool-less request when the prompt is this exact generator;
+// for every other prompt it demands tools. Both markers must be present.
+var titleGenNeedles = []string{"title generator", "never use tools"}
+
+// isTitleRequest reports whether the payload is a title-generation turn.
+func isTitleRequest(p map[string]any) bool {
+	text := strings.ToLower(systemText(p))
+	if text == "" {
+		return false
+	}
+	for _, n := range titleGenNeedles {
+		if !strings.Contains(text, n) {
+			return false
+		}
+	}
+	return true
+}
+
+// applyTools sets the upstream tools array and reports whether the
+// payload changed:
+//   - a title-generation request is forwarded with no tools at all,
+//   - every other request keeps its client-declared tools (client
+//     priority), each guaranteed a parameters schema, with synthetic
+//     definitions appended for any missing core tool name.
+func applyTools(payload map[string]any, proto Protocol, titleReq bool) bool {
+	if titleReq {
+		if _, ok := payload["tools"]; ok {
+			delete(payload, "tools")
+			return true
+		}
+		return false
+	}
+	return ensureTools(payload, proto)
+}
 
 var coreToolNames = []string{"bash", "edit", "glob", "grep", "read"}
 

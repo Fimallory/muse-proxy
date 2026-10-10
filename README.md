@@ -33,7 +33,10 @@ it converts.
   native stream into a single JSON document
 - **Agent-shape guarantee**: client tools always win, but every tool is
   ensured a parameters schema, and missing core tools (`bash/edit/glob/grep/read`)
-  are appended as minimal definitions so free-tier requests pass the gate
+  are appended as minimal definitions so free-tier requests pass the gate.
+  The one exception is opencode's conversation-title request, which the
+  free tier only serves tool-less: it is detected by its prompt markers
+  and forwarded with no tools at all
 - **Session persistence without storing content**: SHA-256 of the first 10k
   chars of request text → stable `ses_*` / `prj_*` IDs; only hashes hit disk,
   entries expire after 3 days

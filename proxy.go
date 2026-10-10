@@ -293,13 +293,16 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 
 	// Build the upstream body: convert when protocols differ, otherwise
 	// patch tools in place. Keep original bytes when nothing changed.
+	// A title-generation turn must go upstream tool-less, everything else
+	// gets its tools normalized.
 	var body []byte
 	converted := false
+	titleReq := isTitleRequest(decoded)
 	if native != clientProto {
 		ir := decodeRequest(clientProto, decoded)
 		// The client stream flag travels with the IR.
 		up := encodeRequest(native, ir)
-		ensureTools(up, native)
+		applyTools(up, native, titleReq)
 		if re, err := marshalNoEscape(up); err == nil {
 			body = re
 			converted = true
@@ -307,7 +310,7 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 	}
 	if body == nil {
 		body = origBody
-		if ensureTools(decoded, native) {
+		if applyTools(decoded, native, titleReq) {
 			if re, err := marshalNoEscape(decoded); err == nil {
 				body = re
 			}

@@ -28,7 +28,9 @@ OpenCode 客户端同一份能力目录把每个模型路由到它的**原生协
   `stream:false` 把任意原生流折叠成单个 JSON
 - **agent 形状保障**：客户端声明的工具优先原样保留，但每个工具保证有
   parameters（缺的补 `{"type":"object","properties":{}}`），缺失的核心工具
- （bash/edit/glob/grep/read）追加最小定义，免费层门禁可过
+ （bash/edit/glob/grep/read）追加最小定义，免费层门禁可过。唯一例外是
+  opencode 的会话标题请求：免费层只接受它**不带工具**，按 prompt 特征
+  识别后原样透传、不注入任何工具
 - **不存内容只存 hash 的会话持久化**：请求文本前 10k 字符 SHA-256 →
   稳定 `ses_*` / `prj_*`；落盘只有 hash，3 天清理
 - **智能出口**：优先本机直连，429/5xx/传输失败时切代理池；池内每次都建
