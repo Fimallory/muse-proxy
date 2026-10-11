@@ -694,7 +694,12 @@ type transcoder struct {
 
 	// responses output
 	respMsgOpen  bool
+	respMsgID    string
+	respMsgIdx   int
 	respToolOpen map[string]bool
+	respToolID   map[string]string
+	respToolCall map[string]string
+	respToolIdx  map[string]int
 
 	// messages output
 	msgStarted bool
@@ -725,6 +730,9 @@ func newTranscoder(to Protocol, model string) *transcoder {
 		to: to, model: model,
 		chatToolIndex: map[string]int{},
 		respToolOpen:  map[string]bool{},
+		respToolID:    map[string]string{},
+		respToolCall:  map[string]string{},
+		respToolIdx:   map[string]int{},
 		accTools:      map[string]*IRToolCall{},
 	}
 }
@@ -899,20 +907,21 @@ func (t *transcoder) emitText(text string) []byte {
 		var out []byte
 		if !t.respMsgOpen {
 			t.respMsgOpen = true
-			idx := t.outIndex
+			t.respMsgIdx = t.outIndex
 			t.outIndex++
+			t.respMsgID = RandomID("msg", 12)
 			out = append(out, sseFrame("response.output_item.added",
 				mustJSON(map[string]any{"type": "response.output_item.added", "sequence_number": t.nextSeq(),
-					"output_index": idx, "item": map[string]any{"id": RandomID("msg", 12),
+					"output_index": t.respMsgIdx, "item": map[string]any{"id": t.respMsgID,
 						"type": "message", "role": "assistant", "status": "in_progress", "content": []any{}}}))...)
 			out = append(out, sseFrame("response.content_part.added",
 				mustJSON(map[string]any{"type": "response.content_part.added", "sequence_number": t.nextSeq(),
-					"item_id": "msg", "output_index": idx, "content_index": 0,
+					"item_id": t.respMsgID, "output_index": t.respMsgIdx, "content_index": 0,
 					"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}))...)
 		}
 		out = append(out, sseFrame("response.output_text.delta",
 			mustJSON(map[string]any{"type": "response.output_text.delta", "sequence_number": t.nextSeq(),
-				"content_index": 0, "output_index": 0, "delta": text}))...)
+				"item_id": t.respMsgID, "content_index": 0, "output_index": t.respMsgIdx, "delta": text}))...)
 		return out
 	case ProtoMessages:
 		var out []byte
@@ -1018,20 +1027,29 @@ func (t *transcoder) emitTool(ev uevent) []byte {
 			idx := t.outIndex
 			t.outIndex++
 			fcid := RandomID("fc", 12)
+			callID := ev.toolID
+			if callID == "" {
+				callID = RandomID("call", 12)
+			}
+			t.respToolID[key] = fcid
+			t.respToolCall[key] = callID
+			t.respToolIdx[key] = idx
 			out = append(out, sseFrame("response.output_item.added",
 				mustJSON(map[string]any{"type": "response.output_item.added", "sequence_number": t.nextSeq(),
 					"output_index": idx, "item": map[string]any{"id": fcid, "type": "function_call",
-						"status": "in_progress", "arguments": "", "call_id": ev.toolID, "name": ev.toolName}}))...)
+						"status": "in_progress", "arguments": "", "call_id": callID, "name": ev.toolName}}))...)
 		}
 		if ev.toolArgs != "" {
 			out = append(out, sseFrame("response.function_call_arguments.delta",
 				mustJSON(map[string]any{"type": "response.function_call_arguments.delta",
-					"sequence_number": t.nextSeq(), "item_id": ev.toolID, "delta": ev.toolArgs}))...)
+					"sequence_number": t.nextSeq(), "item_id": t.respToolID[key],
+					"output_index": t.respToolIdx[key], "delta": ev.toolArgs}))...)
 		}
 		if ev.toolDone {
 			out = append(out, sseFrame("response.function_call_arguments.done",
 				mustJSON(map[string]any{"type": "response.function_call_arguments.done",
-					"sequence_number": t.nextSeq(), "item_id": ev.toolID, "arguments": ev.toolArgs}))...)
+					"sequence_number": t.nextSeq(), "item_id": t.respToolID[key],
+					"output_index": t.respToolIdx[key], "arguments": ev.toolArgs}))...)
 		}
 		return out
 	case ProtoMessages:
@@ -1110,6 +1128,7 @@ func (t *transcoder) emitFinish(stop string) []byte {
 		}
 		usageMap = map[string]any{"input_tokens": t.usageIn, "output_tokens": t.usageOut,
 			"total_tokens": t.usageIn + t.usageOut}
+		var out []byte
 		output := make([]any, 0, len(t.accOrder)+2)
 		if r := t.accReason.String(); r != "" {
 			output = append(output, map[string]any{"id": RandomID("rs", 12),
@@ -1117,10 +1136,20 @@ func (t *transcoder) emitFinish(stop string) []byte {
 				"summary": []any{map[string]any{"type": "summary_text", "text": r}}})
 		}
 		if txt := t.accText.String(); txt != "" || len(t.accOrder) == 0 {
-			output = append(output, map[string]any{"id": RandomID("msg", 12),
-				"type": "message", "role": "assistant", "status": "completed",
+			mid := t.respMsgID
+			if mid == "" {
+				mid = RandomID("msg", 12)
+			}
+			item := map[string]any{"id": mid, "type": "message", "role": "assistant",
+				"status": "completed",
 				"content": []any{map[string]any{"type": "output_text", "text": txt,
-					"annotations": []any{}}}})
+					"annotations": []any{}}}}
+			if t.respMsgOpen {
+				out = append(out, sseFrame("response.output_item.done",
+					mustJSON(map[string]any{"type": "response.output_item.done",
+						"sequence_number": t.nextSeq(), "output_index": t.respMsgIdx, "item": item}))...)
+			}
+			output = append(output, item)
 		}
 		for _, k := range t.accOrder {
 			tc := t.accTools[k]
@@ -1131,20 +1160,33 @@ func (t *transcoder) emitFinish(stop string) []byte {
 			if args == "" {
 				args = "{}"
 			}
-			callID := tc.ID
+			fcid := t.respToolID[k]
+			if fcid == "" {
+				fcid = RandomID("fc", 12)
+			}
+			callID := t.respToolCall[k]
+			if callID == "" {
+				callID = tc.ID
+			}
 			if callID == "" {
 				callID = RandomID("call", 12)
 			}
-			output = append(output, map[string]any{"id": RandomID("fc", 12),
-				"type": "function_call", "status": "completed",
-				"call_id": callID, "name": tc.Name, "arguments": args})
+			item := map[string]any{"id": fcid, "type": "function_call", "status": "completed",
+				"call_id": callID, "name": tc.Name, "arguments": args}
+			if t.respToolOpen[k] {
+				out = append(out, sseFrame("response.output_item.done",
+					mustJSON(map[string]any{"type": "response.output_item.done",
+						"sequence_number": t.nextSeq(), "output_index": t.respToolIdx[k], "item": item}))...)
+			}
+			output = append(output, item)
 		}
 		completed := map[string]any{"id": id, "object": "response",
 			"created_at": time.Now().Unix(), "model": t.modelName(""),
 			"status": "completed", "usage": usageMap, "output": output}
-		return sseFrame("response.completed",
+		out = append(out, sseFrame("response.completed",
 			mustJSON(map[string]any{"type": "response.completed",
-				"sequence_number": t.nextSeq(), "response": completed}))
+				"sequence_number": t.nextSeq(), "response": completed}))...)
+		return out
 	case ProtoMessages:
 		switch stop {
 		case "tool_calls":
