@@ -9,6 +9,8 @@ import (
 	"math/big"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Identity helpers. Session/project shapes mirror what the Zen free tier
@@ -32,6 +34,11 @@ const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 // official session shape (preserving upstream prompt-cache affinity).
 // Any other identity is deterministically hashed into the canonical shape
 // so the same conversation always maps to the same session.
+// NOTE (v2.0.29): hashed sessions carry a random (non-time-ordered) time
+// part and are rejected by the tightened gate, which checks the embedded
+// timestamp for freshness. FreshSessionID below must be used for any
+// session minted for upstream; CanonicalSessionID is only for validating
+// (preserving) genuine client-supplied sessions.
 func CanonicalSessionID(signal string) string {
 	if canonicalSessionPattern.MatchString(signal) {
 		return signal
@@ -40,6 +47,55 @@ func CanonicalSessionID(signal string) string {
 	timePart := hex.EncodeToString(sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
+}
+
+// sessionClock replicates packages/schema/src/identifier.ts create(true):
+// per-ms counter so same-ms requests don't collide. The first 12 hex
+// chars are time-ordered descending data (~(timestamp*0x1000+counter));
+// the gate checks them for freshness since v2.0.29.
+var sessionClock struct {
+	sync.Mutex
+	last int64
+	ctr  uint64
+}
+
+// FreshSessionID mints a genuine time-ordered descending session ID,
+// indistinguishable from what opencode 2.0.29 generates locally.
+func FreshSessionID() string {
+	now := time.Now().UnixMilli()
+	sessionClock.Lock()
+	if now != sessionClock.last {
+		sessionClock.last = now
+		sessionClock.ctr = 0
+	}
+	sessionClock.ctr++
+	ctr := sessionClock.ctr
+	sessionClock.Unlock()
+
+	current := uint64(now)*0x1000 + ctr
+	value := ^current
+	var timeBytes [6]byte
+	for i := 0; i < 6; i++ {
+		shift := uint((5 - i) * 8)
+		timeBytes[i] = byte((value >> shift) & 0xff)
+	}
+	timePart := hex.EncodeToString(timeBytes[:])
+	randomPart := base62Random(14)
+	return "ses_" + timePart + randomPart
+}
+
+// base62Random returns n random base62 chars from crypto/rand.
+func base62Random(n int) string {
+	const chars = base62Alphabet
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	out := make([]byte, n)
+	for i, b := range buf {
+		out[i] = chars[int(b)%62]
+	}
+	return string(out)
 }
 
 // StableID derives a stable prefixed hex ID from a signal.

@@ -472,15 +472,31 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 
 	switch {
 	case explicitSess != "":
-		session = CanonicalSessionID(strings.TrimSpace(explicitSess))
+		// Preserve genuine client sessions (time-ordered, fresh).
+		// Non-canonical signals are NOT hashed (hash time-parts are
+		// random and rejected since v2.0.29): mint fresh instead.
+		if canonicalSessionPattern.MatchString(strings.TrimSpace(explicitSess)) {
+			session = strings.TrimSpace(explicitSess)
+		} else {
+			session = FreshSessionID()
+		}
 	case metaSess != "":
-		session = CanonicalSessionID(strings.TrimSpace(metaSess))
-	case stored != nil:
+		if canonicalSessionPattern.MatchString(strings.TrimSpace(metaSess)) {
+			session = strings.TrimSpace(metaSess)
+		} else {
+			session = FreshSessionID()
+		}
+	case stored != nil && canonicalSessionPattern.MatchString(stored.Session):
+		// Reuse only sessions that still carry a valid shape; hash-based
+		// legacy entries have random time-parts and are rejected now.
+		// Freshness is not checked here (store TTL bounds staleness).
 		session = stored.Session
-	case textEmpty:
-		session = CanonicalSessionID("empty:" + RandomID("r", 8))
 	default:
-		session = CanonicalSessionID("content:" + hash)
+		// v2.0.29 checks the embedded timestamp for freshness: every
+		// minted session must be time-ordered now, not content-hashed.
+		// Stability across retries is sacrificed for passing the gate;
+		// genuine clients (explicit headers) still pin their session.
+		session = FreshSessionID()
 	}
 
 	switch {
