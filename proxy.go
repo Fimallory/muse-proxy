@@ -19,8 +19,14 @@ import (
 	"time"
 )
 
-// defaultUA mirrors a real OpenCode client.
-const defaultUA = "opencode/1.18.31 (linux amd64; go1.24.0)"
+// defaultUA mirrors a real OpenCode v2 client (captured 2.0.29).
+// Format is opencode/<channel>/<version>/<name>, e.g. CLI sends
+// "opencode/latest/2.0.29/cli". The free tier rejects anything else
+// with 403 FreeTierError since the v2.0.29 abuse-protection tightening.
+const defaultUA = "opencode/latest/2.0.29/cli"
+
+// defaultClient mirrors App.name for the CLI.
+const defaultClient = "cli"
 
 // maxBody caps forwarded request bodies at 32 MiB, like other 2api gateways.
 const maxBody = 32 << 20
@@ -145,22 +151,31 @@ func (s *Server) close() {}
 
 // deterministic4xx reports request shapes the upstream will always reject
 // regardless of egress: retrying them through another route cannot help.
+// NOTE (v2.0.29): 403 FreeTierError is egress-sensitive (IP/PoP abuse
+// protection) — a different egress node may still return 200 — so 403 is
+// deliberately NOT deterministic and fails over to the pool.
 func deterministic4xx(status int) bool {
+	if status == http.StatusForbidden {
+		return false
+	}
 	return status >= 400 && status < 500 && status != http.StatusTooManyRequests
 }
 
 // shouldFailover reports whether a failed direct attempt is worth retrying
-// through the pool: transport errors, rate limits and server errors.
+// through the pool: transport errors, rate limits, server errors, and 403
+// (free-tier gate may clear on a different egress IP/PoP since v2.0.29).
 func shouldFailover(status int, err error) bool {
 	if err != nil {
 		return true
 	}
-	return status == http.StatusTooManyRequests || status >= 500
+	return status == http.StatusTooManyRequests || status == http.StatusForbidden || status >= 500
 }
 
 // banDirect takes the direct route out of rotation for a while:
 // a throttled route stays out for DirectCooldown (or longer when the
 // upstream names a Retry-After); a broken route gets a brief backoff.
+// A 403 free-tier refusal also cools direct down briefly so the pool
+// (different egress) gets a chance; the gate may clear there.
 func (s *Server) banDirect(resp *http.Response, err error) {
 	var cd time.Duration
 	if err != nil {
@@ -171,6 +186,9 @@ func (s *Server) banDirect(resp *http.Response, err error) {
 		if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > cd {
 			cd = ra
 		}
+	}
+	if resp != nil && resp.StatusCode == http.StatusForbidden {
+		cd = 30 * time.Second
 	}
 	if cd > 0 {
 		s.banUntil.Store(time.Now().Add(cd).UnixNano())
@@ -291,6 +309,12 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 		return
 	}
 
+	// Resolve session/project first: v2 body fields (prompt_cache_key)
+	// and upstream headers both derive from the same session.
+	instr0, input0 := extractTexts(origBody)
+	hash0 := contentHash(instr0, input0, s.cfg.HashPrefixChars)
+	session0, project0 := s.resolveIDs(r, origBody, hash0, instr0 == "" && input0 == "")
+
 	// Build the upstream body: convert when protocols differ, otherwise
 	// patch tools in place. Keep original bytes when nothing changed.
 	// A title-generation turn must go upstream tool-less, everything else
@@ -303,6 +327,11 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 		// The client stream flag travels with the IR.
 		up := encodeRequest(native, ir)
 		applyTools(up, native, titleReq)
+		// v2 inference requires agent-shape body fields that the IR
+		// does not model: carry them over so converted requests still
+		// read as from-within-OpenCode (captured 2.0.29).
+		carryV2Fields(decoded, clientProto, up, native)
+		ensureV2ResponsesFields(up, session0)
 		if re, err := marshalNoEscape(up); err == nil {
 			body = re
 			converted = true
@@ -310,7 +339,14 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 	}
 	if body == nil {
 		body = origBody
-		if applyTools(decoded, native, titleReq) {
+		changed := applyTools(decoded, native, titleReq)
+		// Same-protocol path stays byte-transparent when tools already
+		// match; still ensure v2 body fields for stale (v1) clients that
+		// omit them, without touching genuine v2 bodies.
+		if ensureV2ResponsesFields(decoded, session0) {
+			changed = true
+		}
+		if changed {
 			if re, err := marshalNoEscape(decoded); err == nil {
 				body = re
 			}
@@ -334,26 +370,61 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 	}
 
 	instr, input := extractTexts(origBody)
-	hash := contentHash(instr, input, s.cfg.HashPrefixChars)
-	session, project := s.resolveIDs(r, origBody, hash, instr == "" && input == "")
+	_ = instr
+	_ = input
+	session, project := session0, project0
 
-	rid := strings.TrimSpace(r.Header.Get("x-opencode-request"))
-	if rid == "" {
-		rid = RandomID("req", 16)
+	// Mimic a genuine v2 client (captured 2.0.29):
+	//   User-Agent: opencode/latest/2.0.29/cli
+	//   x-opencode-client: cli
+	//   x-opencode-session / x-opencode-session-id / x-session-affinity /
+	//     x-session-id / X-Session-Id: all carry the same ses_ value
+	//   x-opencode-project: 32 hex (no prj_ prefix)
+	//   Authorization: Bearer public is sent (stripped to anonymous
+	//     upstream by inference-proxy); no x-opencode-request headers —
+	//     genuine v2 sends b3/traceparent instead (forwarded untouched
+	//     via copyHeaderStrip when the downstream client supplies them).
+	// Preserve downstream values when present so a genuine v2 client
+	// passes through byte-identical; only fill gaps with v2 defaults.
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	if ua == "" || !strings.HasPrefix(strings.ToLower(ua), "opencode/") {
+		ua = defaultUA
 	}
+	client := strings.TrimSpace(r.Header.Get("x-opencode-client"))
+	if client == "" {
+		client = defaultClient
+	}
+	// Genuine v2 (Bun fetch) sends Accept: */*; preserve it verbatim
+	// for logging, but upstream free-tier expects the agent Accept.
+	// (Measured: preserving */* breaks chat via proxy; overwriting
+	// passes. Keep overwrite.)
 	extra := map[string]string{
-		"x-opencode-session": session,
-		"x-session-affinity": session,
-		"X-Session-Id":       session,
-		"x-opencode-project": project,
-		"x-opencode-request": rid,
-		"x-opencode-client":  "cli",
-		"Accept":             "application/json, text/event-stream",
-		"User-Agent":         defaultUA,
+		"x-opencode-session":    session,
+		"x-opencode-session-id": session,
+		"x-session-affinity":    session,
+		"x-session-id":          session,
+		"X-Session-Id":          session,
+		"x-opencode-project":    project,
+		"x-opencode-client":     client,
+		"Accept":                "application/json, text/event-stream",
+		"User-Agent":            ua,
+	}
+	// Old v1 request-ID headers are no longer sent by genuine v2 and
+	// mark traffic as external: make sure they never reach upstream,
+	// even when a stale downstream client still sends them.
+	// (Deleted in roundTrip build; kept here for the echo headers.)
+	rid := firstHeader(r, "x-opencode-request-id", "x-opencode-request")
+	if strings.TrimSpace(rid) == "" {
+		rid = RandomID("req", 16)
+	} else {
+		rid = strings.TrimSpace(rid)
 	}
 	// Anthropic endpoints authenticate on x-api-key instead of Authorization.
+	// Omit entirely when anonymous.
 	if native == ProtoMessages {
-		extra["x-api-key"] = s.cfg.ZenKey
+		if zk := strings.TrimSpace(s.cfg.ZenKey); zk != "" && zk != "public" {
+			extra["x-api-key"] = zk
+		}
 	}
 	s.forwardProto(w, r, native, clientProto, body, extra, rid, session, project, model, collapse)
 }
@@ -383,7 +454,7 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 	_ = json.Unmarshal(body, &decoded)
 
 	explicitSess := firstHeader(r,
-		"x-opencode-session", "x-session-affinity", "X-Session-Id", "x-session-id")
+		"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id", "x-session-id")
 	metaSess, metaProj := "", ""
 	if decoded != nil {
 		metaSess = jsonStringAt(decoded, "metadata", "session_id")
@@ -414,13 +485,21 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 
 	switch {
 	case explicitProj != "":
-		project = explicitProj
+		project = CanonicalProjectID(explicitProj)
 	case metaProj != "":
-		project = metaProj
+		project = CanonicalProjectID(metaProj)
 	case stored != nil && stored.Project != "":
 		project = stored.Project
 	default:
-		project = StableID("prj", session)
+		// Derive a stable v2 project (32 hex) from the session so the
+		// same conversation reuses the same project upstream.
+		sum := contentHash(session, "", 10000)
+		// contentHash returns 64 hex; v2 projects are 32 hex.
+		if len(sum) >= 32 {
+			project = sum[:32]
+		} else {
+			project = CanonicalProjectID("content:" + hash)
+		}
 	}
 
 	if !textEmpty {
@@ -609,7 +688,23 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 			return nil, err
 		}
 		copyHeaderStrip(req.Header, r.Header)
-		req.Header.Set("Authorization", "Bearer "+s.cfg.ZenKey)
+		// Genuine v2 never sends the old request-ID headers; their
+		// presence marks traffic as external since 2.0.29.
+		req.Header.Del("x-opencode-request")
+		req.Header.Del("x-opencode-request-id")
+		// Keyless requests go upstream without credentials (`public`
+		// is stripped by console inference-proxy anyway). Measured:
+		// omitting auth passes chat via proxy; sending Bearer public
+		// breaks it. Match the passing behavior.
+		anonymous := strings.TrimSpace(s.cfg.ZenKey) == "" ||
+			strings.TrimSpace(s.cfg.ZenKey) == "public"
+		if !anonymous {
+			req.Header.Set("Authorization", "Bearer "+s.cfg.ZenKey)
+		} else {
+			req.Header.Del("Authorization")
+			req.Header.Del("x-api-key")
+			req.Header.Del("x-goog-api-key")
+		}
 		for k, v := range extra {
 			if req.Header.Get(k) == "" || strings.HasPrefix(strings.ToLower(k), "x-opencode-") || k == "Accept" || k == "User-Agent" {
 				req.Header.Set(k, v)

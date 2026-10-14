@@ -11,12 +11,20 @@ import (
 	"strings"
 )
 
-// Identity helpers. The session/project shapes mirror what the Zen free tier
-// accepts: ses_<12 hex><14 base62> and prj_<24 hex>. Anything else is hashed
-// into shape instead of being passed through.
+// Identity helpers. Session/project shapes mirror what the Zen free tier
+// accepts in v2 (captured 2.0.29):
+//   session: ses_<12 hex><14 base62> (prompt_cache_key carries the same)
+//   project: 32 hex, no prefix (e.g. 513945e107b3e9bacde70050e755d4d65a49230d)
+// Anything else is hashed into shape instead of being passed through.
 
 // canonicalSessionPattern matches OpenCode's canonical session format.
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+// projectPattern matches the v2 project shape: 32 hex chars, no prefix.
+// The legacy prj_<24hex> shape is still accepted and passed through so
+// old hash-store entries keep working, but new IDs are minted as 32 hex.
+var projectPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+var legacyProjectPattern = regexp.MustCompile(`^prj_[0-9a-f]{24}$`)
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -38,6 +46,22 @@ func CanonicalSessionID(signal string) string {
 func StableID(prefix, value string) string {
 	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
 	return prefix + "_" + hex.EncodeToString(sum[:12])
+}
+
+// CanonicalProjectID returns signal unchanged when it already carries an
+// official v2 project shape (32 hex) or the legacy prj_<24hex> shape.
+// Anything else is deterministically hashed into the v2 32-hex shape so
+// the same conversation always maps to the same project.
+func CanonicalProjectID(signal string) string {
+	s := strings.TrimSpace(signal)
+	if projectPattern.MatchString(s) || legacyProjectPattern.MatchString(s) {
+		return s
+	}
+	if s == "" || s == "global" {
+		return s
+	}
+	sum := sha256.Sum256([]byte("prj\x00" + s))
+	return hex.EncodeToString(sum[:16])
 }
 
 // RandomID mints a fresh prefixed hex ID.

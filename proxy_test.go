@@ -46,8 +46,8 @@ func TestEnsureToolsAbsent(t *testing.T) {
 		t.Fatal("expected change")
 	}
 	names := toolNames(t, p)
-	if len(names) != 5 {
-		t.Fatalf("want 5 tools, got %v", names)
+	if len(names) != len(coreToolNames) {
+		t.Fatalf("want %d tools, got %v", len(coreToolNames), names)
 	}
 	for _, want := range coreToolNames {
 		found := false
@@ -66,9 +66,9 @@ func TestEnsureToolsClientPriority(t *testing.T) {
 	p := mustObj(t, `{"model":"m","input":"hi","stream":true,"tools":[
 		{"type":"function","name":"weather","description":"Real tool",
 		 "parameters":{"type":"object","properties":{"city":{"type":"string"}}}},
-		{"type":"function","name":"bash"}]}`)
+		{"type":"function","name":"shell"}]}`)
 	if !ensureResponseTools(p) {
-		t.Fatal("expected change (bash params + missing cores)")
+		t.Fatal("expected change (shell params + missing cores)")
 	}
 	raw := p["tools"].([]any)
 	// Client tools keep position and content.
@@ -80,40 +80,40 @@ func TestEnsureToolsClientPriority(t *testing.T) {
 	if _, ok := params["properties"].(map[string]any)["city"]; !ok {
 		t.Fatalf("client params were clobbered: %v", params)
 	}
-	// bash got default params.
+	// shell got default params.
 	second := raw[1].(map[string]any)
 	if _, ok := second["parameters"].(map[string]any); !ok {
-		t.Fatalf("bash params not filled: %v", second)
+		t.Fatalf("shell params not filled: %v", second)
 	}
 	// Missing cores appended.
 	names := toolNames(t, p)
-	if len(names) != 2+4 {
-		t.Fatalf("want 6 tools, got %v", names)
+	if len(names) != 2+len(coreToolNames)-1 {
+		t.Fatalf("want %d tools, got %v", 2+len(coreToolNames)-1, names)
 	}
 }
 
 func TestEnsureToolsUntouched(t *testing.T) {
-	p := mustObj(t, `{"model":"m","input":"hi","stream":true,"tools":[
-		{"type":"function","name":"bash","parameters":{"type":"object","properties":{}}},
-		{"type":"function","name":"edit","parameters":{"type":"object","properties":{}}},
-		{"type":"function","name":"glob","parameters":{"type":"object","properties":{}}},
-		{"type":"function","name":"grep","parameters":{"type":"object","properties":{}}},
-		{"type":"function","name":"read","parameters":{"type":"object","properties":{}}}]}`)
+	// A genuine v2 toolset must pass through byte-identical.
+	parts := make([]string, 0, len(coreToolNames))
+	for _, n := range coreToolNames {
+		parts = append(parts, `{"type":"function","name":"`+n+`","parameters":{"type":"object","properties":{}}}`)
+	}
+	p := mustObj(t, `{"model":"m","input":"hi","stream":true,"tools":[ `+strings.Join(parts, ",")+` ]}`)
 	if ensureResponseTools(p) {
 		t.Fatal("expected no change")
 	}
 }
 
 func TestEnsureToolsDropsJunk(t *testing.T) {
-	p := mustObj(t, `{"model":"m","input":"hi","stream":true,"tools":[null,{}, {"type":"function","name":"bash"}]}`)
+	p := mustObj(t, `{"model":"m","input":"hi","stream":true,"tools":[null,{}, {"type":"function","name":"shell"}]}`)
 	if !ensureResponseTools(p) {
 		t.Fatal("expected change")
 	}
 	names := toolNames(t, p)
 	// {} has no name but is an object: kept, then cores appended.
-	// null dropped. bash patched. edit/glob/grep/read appended.
-	if len(names) != 1+1+4 {
-		t.Fatalf("want 6 entries, got %v", names)
+	// null dropped. shell patched. remaining cores appended.
+	if len(names) != 1+1+len(coreToolNames)-1 {
+		t.Fatalf("want %d entries, got %v", 1+1+len(coreToolNames)-1, names)
 	}
 }
 
@@ -197,16 +197,22 @@ func TestFailoverClassification(t *testing.T) {
 	if !shouldFailover(429, nil) || !shouldFailover(500, nil) || !shouldFailover(503, nil) {
 		t.Fatal("429/5xx must fail over")
 	}
+	if !shouldFailover(403, nil) {
+		t.Fatal("403 must fail over (egress-sensitive since v2.0.29)")
+	}
 	if !shouldFailover(0, errTest) {
 		t.Fatal("transport error must fail over")
 	}
-	for _, s := range []int{400, 401, 403, 404, 422} {
+	for _, s := range []int{400, 401, 404, 422} {
 		if shouldFailover(s, nil) {
 			t.Fatalf("%d must not fail over", s)
 		}
 		if !deterministic4xx(s) {
 			t.Fatalf("%d must be deterministic", s)
 		}
+	}
+	if deterministic4xx(403) {
+		t.Fatal("403 must not be deterministic (fails over to pool)")
 	}
 	if deterministic4xx(429) || deterministic4xx(500) {
 		t.Fatal("429/500 are not deterministic")
