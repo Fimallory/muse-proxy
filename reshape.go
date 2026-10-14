@@ -125,9 +125,10 @@ func v2ToolMeta(name string) (desc string, params map[string]any) {
 		return "Edit the contents of a file by finding and replacing exact text. When editing text from Read output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":      map[string]any{"type": "string"},
-				"oldString": map[string]any{"type": "string"},
-				"newString": map[string]any{"type": "string"},
+				"path":       map[string]any{"type": "string"},
+				"oldString":  map[string]any{"type": "string"},
+				"newString":  map[string]any{"type": "string"},
+				"replaceAll": map[string]any{"type": "boolean"},
 			},
 			"required": []any{"path", "oldString", "newString"}, "additionalProperties": false,
 		}
@@ -137,6 +138,8 @@ func v2ToolMeta(name string) (desc string, params map[string]any) {
 			"properties": map[string]any{
 				"pattern": map[string]any{"type": "string"},
 				"path":    map[string]any{"type": "string"},
+				"hidden":  map[string]any{"type": "boolean"},
+				"limit":   map[string]any{"type": "integer", "exclusiveMinimum": 0},
 			},
 			"required": []any{"pattern"}, "additionalProperties": false,
 		}
@@ -144,9 +147,12 @@ func v2ToolMeta(name string) (desc string, params map[string]any) {
 		return "Search file contents using ripgrep's regular expression syntax or literal text matching.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"pattern": map[string]any{"type": "string"},
-				"path":    map[string]any{"type": "string"},
-				"include": map[string]any{"type": "string"},
+				"pattern":       map[string]any{"type": "string", "minLength": 1},
+				"path":          map[string]any{"type": "string"},
+				"include":       map[string]any{"type": "string"},
+				"literal":       map[string]any{"type": "boolean"},
+				"caseSensitive": map[string]any{"type": "boolean"},
+				"limit":         map[string]any{"type": "integer", "exclusiveMinimum": 0},
 			},
 			"required": []any{"pattern"}, "additionalProperties": false,
 		}
@@ -154,7 +160,21 @@ func v2ToolMeta(name string) (desc string, params map[string]any) {
 		return "Use this tool when you need to ask the user questions during execution.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"questions": map[string]any{"type": "array"},
+				"questions": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"question": map[string]any{"type": "string"},
+							"header":   map[string]any{"type": "string"},
+							"options":  map[string]any{"type": "array"},
+							"multiple": map[string]any{"type": "boolean"},
+						},
+						"required":             []any{"question", "header", "options"},
+						"additionalProperties": false,
+					},
+					"minItems": 1,
+				},
 			},
 			"required": []any{"questions"}, "additionalProperties": false,
 		}
@@ -191,17 +211,22 @@ func v2ToolMeta(name string) (desc string, params map[string]any) {
 		return "Spawns an agent in a child session to work on the specified task.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"prompt":      map[string]any{"type": "string"},
+				"agent":       map[string]any{"type": "string"},
+				"sessionID":   map[string]any{"type": "string"},
+				"model":       map[string]any{"type": "string"},
+				"background":  map[string]any{"type": "boolean"},
 				"description": map[string]any{"type": "string"},
+				"prompt":      map[string]any{"type": "string"},
 			},
-			"required": []any{"prompt"}, "additionalProperties": false,
+			"required": []any{"agent", "description", "prompt"}, "additionalProperties": false,
 		}
 	case "webfetch":
 		return "Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"url":    map[string]any{"type": "string"},
-				"format": map[string]any{"type": "string"},
+				"url":     map[string]any{"type": "string"},
+				"format":  map[string]any{"type": "string", "enum": []any{"text", "markdown", "html"}},
+				"timeout": map[string]any{"type": "number", "exclusiveMinimum": 0, "maximum": 120},
 			},
 			"required": []any{"url"}, "additionalProperties": false,
 		}
