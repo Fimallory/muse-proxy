@@ -839,6 +839,15 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		// presence marks traffic as external since 2.0.29.
 		req.Header.Del("x-opencode-request")
 		req.Header.Del("x-opencode-request-id")
+		// Never forward the downstream Accept-Encoding upstream. Every
+		// body inspection here (empty-reply guard, SSE transcode,
+		// collapse, models filter) assumes plain text, but a forwarded
+		// `br`/`zstd` makes upstream answer with binary that Go then
+		// refuses to decode (explicit header = no transparent decoding)
+		// and that binary can reach the client mislabeled as JSON/SSE.
+		// Deleting it lets Go negotiate gzip itself and decode
+		// transparently, so upstream bodies are always plain text.
+		req.Header.Del("Accept-Encoding")
 		// The credential is mandatory on the /inference/v1 endpoint
 		// (measured: omitting it returns 403 FreeTierError). Keyless
 		// clients send the literal `public`.

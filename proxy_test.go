@@ -193,6 +193,53 @@ func TestCollapseFailed(t *testing.T) {
 	}
 }
 
+// TestUpstreamAcceptEncodingStripped: a downstream `br` must never reach
+// upstream, or upstream answers with binary that Go refuses to decode
+// (explicit header disables transparent decoding) and that binary can
+// reach the client mislabeled as JSON/SSE. Deleting the header lets Go
+// negotiate (gzip) and decode transparently.
+func TestUpstreamAcceptEncodingStripped(t *testing.T) {
+	var gotAE string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAE = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{
+		Listen: "127.0.0.1:0", ServerKeys: []string{"k"}, ZenKey: "z",
+		Upstream: upstream.URL, Proxies: []string{"direct"},
+		PreferDirect: true, DirectCooldownSeconds: 120, PoolMaxAttempts: 3,
+		HashTTLDays: 3, HashMaxEntries: 100, HashPrefixChars: 100,
+		RequestTimeoutSeconds: 30,
+	}
+	cfg.HashTTL = time.Hour
+	cfg.RequestTimeout = 30 * time.Second
+	cfg.DirectCooldown = 120 * time.Second
+	store, err := openStore(t.TempDir()+"/h.json", time.Hour, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	srv, err := newServer(cfg, store, openCatalog(t.TempDir()+"/c.json", "http://example.invalid", time.Hour), newProxyPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("GET", "/v1/models", nil)
+	r.Header.Set("Authorization", "Bearer k")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	resp, err := srv.roundTrip(context.Background(), r, "/v1/models", nil, nil)
+	if err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	resp.Body.Close()
+	if strings.Contains(gotAE, "br") || strings.Contains(gotAE, "zstd") {
+		t.Fatalf("upstream saw downstream encodings: %q", gotAE)
+	}
+}
+
 func TestFailoverClassification(t *testing.T) {
 	if !shouldFailover(429, nil) || !shouldFailover(500, nil) || !shouldFailover(503, nil) {
 		t.Fatal("429/5xx must fail over")
