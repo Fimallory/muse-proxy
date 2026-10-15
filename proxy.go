@@ -251,22 +251,125 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		egress["pool"] = st
 	}
 	entries, updated, source := s.catalog.snapshot()
+	cat := map[string]any{"models": entries, "updated": updated, "source": source}
+	if s.cfg.FreeOnly {
+		cat["free_only"] = true
+		cat["free"] = s.catalog.freeCount()
+	}
 	writeJSON(w, 200, map[string]any{
 		"status":  "ok",
 		"version": version,
 		"hashes":  s.store.count(),
 		"egress":  egress,
-		"catalog": map[string]any{"models": entries, "updated": updated, "source": source},
+		"catalog": cat,
 	})
 }
 
-// handleModels forwards the upstream model list untouched.
+// freeFilterActive reports whether the free-only filter should apply.
+// It stays off until the catalog has free-model data, so a failed or
+// not-yet-finished refresh never hides every model.
+func (s *Server) freeFilterActive() bool {
+	return s.cfg.FreeOnly && s.catalog.hasFreeInfo()
+}
+
+// handleModels relays the upstream model list, filtering it in free-only
+// mode: paid models are dropped and free models lose their "-free" suffix.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	rid := strings.TrimSpace(r.Header.Get("x-opencode-request"))
-	if rid == "" {
-		rid = RandomID("req", 16)
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	if ua == "" || !strings.HasPrefix(strings.ToLower(ua), "opencode/") {
+		ua = defaultUA
 	}
-	s.forward(w, r, "/v1/models", nil, map[string]string{"x-opencode-request": rid}, rid, "", "", "", false)
+	client := strings.TrimSpace(r.Header.Get("x-opencode-client"))
+	if client == "" {
+		client = defaultClient
+	}
+	extra := map[string]string{
+		"x-opencode-client": client,
+		"Accept":            "application/json, text/event-stream",
+		"User-Agent":        ua,
+	}
+	rid := firstHeader(r, "x-opencode-request-id", "x-opencode-request")
+	if strings.TrimSpace(rid) == "" {
+		rid = RandomID("req", 16)
+	} else {
+		rid = strings.TrimSpace(rid)
+	}
+
+	if !s.freeFilterActive() {
+		s.forward(w, r, "/v1/models", nil, extra, rid, "", "", "", false)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+	defer cancel()
+	start := time.Now()
+	resp, err := s.roundTrip(ctx, r, "/v1/models", nil, extra)
+	if err != nil {
+		log.Printf("upstream GET /v1/models error: %v", err)
+		writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed"}})
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode/100 != 2 {
+		copyHeaderStrip(w.Header(), resp.Header)
+		w.Header().Del("Content-Length")
+		setEchoHeaders(w, rid, "", "")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(raw)
+		return
+	}
+	out := s.filterFreeModels(raw)
+	w.Header().Set("Content-Type", "application/json")
+	setEchoHeaders(w, rid, "", "")
+	w.WriteHeader(200)
+	_, _ = w.Write(out)
+	log.Printf("GET /v1/models -> 200 free-only %dB %dms", len(out), time.Since(start).Milliseconds())
+}
+
+// filterFreeModels rewrites a model-list document to the free-only view:
+// entries whose id is not a known free model are dropped, and the rest
+// are renamed to their exposed (suffix-stripped) name. Known free models
+// missing from the upstream list are appended so the list stays complete.
+func (s *Server) filterFreeModels(raw []byte) []byte {
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		doc = map[string]any{"object": "list"}
+	}
+	items, _ := doc["data"].([]any)
+	out := make([]any, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		if id == "" || !s.catalog.isFree(id) {
+			continue
+		}
+		name := exposedModelName(id)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		clone := cloneMap(m)
+		clone["id"] = name
+		out = append(out, clone)
+	}
+	for _, name := range s.catalog.freeModelNames() {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, map[string]any{"id": name, "object": "model", "owned_by": "opencode"})
+	}
+	doc["object"] = "list"
+	doc["data"] = out
+	if re, err := marshalNoEscape(doc); err == nil {
+		return re
+	}
+	return raw
 }
 
 // handleResponses serves the Responses API.
@@ -302,11 +405,32 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "missing model"}})
 		return
 	}
+	// upstreamModel is the id sent upstream; it differs from the client's
+	// when free-only mode strips a "-free" suffix. modelRewritten forces
+	// the same-protocol path to re-encode instead of forwarding raw bytes.
+	upstreamModel := model
+	modelRewritten := false
 	native := s.catalog.nativeProtocol(model)
+	if s.freeFilterActive() {
+		if real, ok := s.catalog.aliasOf(model); ok {
+			upstreamModel = real
+			native = s.catalog.nativeProtocol(real)
+			modelRewritten = true
+		} else if _, known := s.catalog.resolve(model); known && !s.catalog.isFree(model) {
+			writeJSON(w, 400, map[string]any{"error": map[string]any{
+				"message": "model " + model + " is not a free model; this gateway serves free models only"}})
+			return
+		}
+	}
 	if native == ProtoGoogle {
 		writeJSON(w, 400, map[string]any{"error": map[string]any{
 			"message": "model " + model + " uses an unsupported native protocol"}})
 		return
+	}
+	if modelRewritten {
+		// Every downstream path (conversion, tool patching, v2 fields)
+		// reads the model from the decoded body.
+		decoded["model"] = upstreamModel
 	}
 
 	// Resolve session/project first: v2 body fields (prompt_cache_key)
@@ -344,6 +468,10 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 		// match; still ensure v2 body fields for stale (v1) clients that
 		// omit them, without touching genuine v2 bodies.
 		if ensureV2ResponsesFields(decoded, session0) {
+			changed = true
+		}
+		// A stripped free-model name must be written back as the real id.
+		if modelRewritten {
 			changed = true
 		}
 		if changed {
@@ -420,13 +548,14 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 		rid = strings.TrimSpace(rid)
 	}
 	// Anthropic endpoints authenticate on x-api-key instead of Authorization.
-	// Omit entirely when anonymous.
+	// Both are sent: the inference endpoint accepts either, and genuine v2
+	// sends its credential on whichever header the protocol uses.
 	if native == ProtoMessages {
-		if zk := strings.TrimSpace(s.cfg.ZenKey); zk != "" && zk != "public" {
+		if zk := strings.TrimSpace(s.cfg.ZenKey); zk != "" {
 			extra["x-api-key"] = zk
 		}
 	}
-	s.forwardProto(w, r, native, clientProto, body, extra, rid, session, project, model, collapse)
+	s.forwardProto(w, r, native, clientProto, body, extra, rid, session, project, upstreamModel, collapse)
 }
 
 func decodeObj(body []byte) map[string]any {
@@ -708,19 +837,10 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		// presence marks traffic as external since 2.0.29.
 		req.Header.Del("x-opencode-request")
 		req.Header.Del("x-opencode-request-id")
-		// Keyless requests go upstream without credentials (`public`
-		// is stripped by console inference-proxy anyway). Measured:
-		// omitting auth passes chat via proxy; sending Bearer public
-		// breaks it. Match the passing behavior.
-		anonymous := strings.TrimSpace(s.cfg.ZenKey) == "" ||
-			strings.TrimSpace(s.cfg.ZenKey) == "public"
-		if !anonymous {
-			req.Header.Set("Authorization", "Bearer "+s.cfg.ZenKey)
-		} else {
-			req.Header.Del("Authorization")
-			req.Header.Del("x-api-key")
-			req.Header.Del("x-goog-api-key")
-		}
+		// The credential is mandatory on the /inference/v1 endpoint
+		// (measured: omitting it returns 403 FreeTierError). Keyless
+		// clients send the literal `public`.
+		req.Header.Set("Authorization", "Bearer "+s.cfg.ZenKey)
 		for k, v := range extra {
 			if req.Header.Get(k) == "" || strings.HasPrefix(strings.ToLower(k), "x-opencode-") || k == "Accept" || k == "User-Agent" {
 				req.Header.Set(k, v)

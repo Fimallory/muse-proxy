@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -33,6 +34,12 @@ type Config struct {
 	CatalogURL          string  `json:"catalog_url"`
 	CatalogPath         string  `json:"catalog_path"`
 	CatalogRefreshHours float64 `json:"catalog_refresh_hours"`
+
+	// FreeOnly exposes only free models: /v1/models hides paid models and
+	// drops the "-free" suffix from the free ones, and requests for a
+	// known paid model are refused. Stripped names map back to the real
+	// upstream id (so a client can call "muse-spark-1.3-contributor").
+	FreeOnly bool `json:"free_only"`
 
 	// Proxy lists are subscription URLs returning one proxy per line.
 	// Every URL is fetched at startup, its proxies are health-checked
@@ -85,7 +92,13 @@ type ProxySource struct {
 	RefreshHours float64 `json:"refresh_hours"`
 }
 
-const defaultProxyTestURL = "https://opencode.ai/zen/v1/models"
+// v2.0.29 moved the provider API from /zen/v1 to /inference/v1. The old
+// /zen/v1 path is now the legacy migration route and enforces a strict
+// free-tier gate (403 FreeTierError for anything it does not recognise),
+// while /inference/v1 is what a genuine v2 client calls.
+const defaultUpstream = "https://opencode.ai/inference"
+
+const defaultProxyTestURL = "https://opencode.ai/inference/v1/models"
 
 var validProxyProtocols = map[string]bool{
 	"http": true, "https": true, "socks5": true, "socks5h": true,
@@ -98,7 +111,7 @@ func loadConfig(path string) (*Config, error) {
 	}
 	cfg := Config{
 		Listen:                   "127.0.0.1:3334",
-		Upstream:                 "https://opencode.ai/zen",
+		Upstream:                 defaultUpstream,
 		Proxies:                  []string{"direct"},
 		PreferDirect:             true,
 		DirectCooldownSeconds:    120,
@@ -125,7 +138,25 @@ func loadConfig(path string) (*Config, error) {
 	}
 	trimList(&cfg.ServerKeys)
 	cfg.ZenKey = strings.TrimSpace(cfg.ZenKey)
+	if cfg.ZenKey == "" {
+		cfg.ZenKey = "public"
+	}
 	cfg.Upstream = strings.TrimRight(strings.TrimSpace(cfg.Upstream), "/")
+	// Auto-migrate the legacy /zen base path to /inference (v2.0.29).
+	// /zen/v1 is now the migration route with a strict free-tier gate;
+	// /inference/v1 is the endpoint a genuine v2 client uses.
+	if u, err := url.Parse(cfg.Upstream); err == nil && u.Host == "opencode.ai" {
+		switch strings.TrimRight(u.Path, "/") {
+		case "/zen":
+			u.Path = "/inference"
+			log.Printf("upstream %q is the legacy /zen path; using %q instead (opencode v2.0.29 moved the provider API)", cfg.Upstream, strings.TrimRight(u.String(), "/"))
+			cfg.Upstream = strings.TrimRight(u.String(), "/")
+		case "/zen/go":
+			u.Path = "/inference/go"
+			log.Printf("upstream %q is the legacy /zen/go path; using %q instead (opencode v2.0.29 moved the provider API)", cfg.Upstream, strings.TrimRight(u.String(), "/"))
+			cfg.Upstream = strings.TrimRight(u.String(), "/")
+		}
+	}
 	for i := range cfg.Proxies {
 		cfg.Proxies[i] = strings.TrimSpace(cfg.Proxies[i])
 	}
@@ -135,9 +166,6 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if len(cfg.ServerKeys) == 0 {
 		return nil, fmt.Errorf("server_keys must contain at least one local key")
-	}
-	if cfg.ZenKey == "" {
-		return nil, fmt.Errorf("zen_key must not be empty")
 	}
 	u, err := url.Parse(cfg.Upstream)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

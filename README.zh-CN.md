@@ -119,8 +119,8 @@ curl http://localhost:8080/v1/chat/completions \
 |---|---|---|
 | `listen` | `127.0.0.1:8080` | 监听地址 |
 | `server_keys` | （必填） | 本地客户端密钥 |
-| `zen_key` | （必填） | 上游 Zen 凭证（免费模型填 `public` 即可） |
-| `upstream` | `https://opencode.ai/zen` | Zen 基地址 |
+| `zen_key` | `public` | 上游 Zen 凭证（免费模型用 `public`，付费模型用 `oc_sk-…`） |
+| `upstream` | `https://opencode.ai/inference` | Zen 基地址（旧 `/zen` 自动迁移） |
 | `proxies` | `["direct"]` | 出口池：`direct`、`http(s)://`、`socks5(h)://`（URL 可带账密） |
 | `reuse_proxy_connections` | `false` | 仅固定单节点代理才开；代理池必须每次新建连接才能轮转 |
 | `prefer_direct` | `true` | 优先本机出口，429/5xx/传输失败时切池 |
@@ -137,6 +137,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `catalog_url` | `https://models.opencode.ai/api.json` | 能力目录 |
 | `catalog_path` | `./catalog.json` | 持久化的模型→协议表 |
 | `catalog_refresh_hours` | `24` | 刷新间隔（失败保留旧表） |
+| `free_only` | `false` | 只暴露免费模型：`/v1/models` 隐藏付费模型、free 模型去掉 `-free` 后缀，请求付费模型直接拒绝 |
 | `request_timeout_seconds` | `600` | 单请求总预算（含全部尝试） |
 
 `LISTEN` 环境变量覆盖 `listen`。未知 JSON 字段直接拒绝。
@@ -146,7 +147,7 @@ curl http://localhost:8080/v1/chat/completions \
 优先级：显式 `x-opencode-session` / `x-session-affinity` /
 `X-Session-Id` 头 → `metadata.session_id` → hash 库命中 → 现场生成。
 非规范形状一律哈希成官方 `ses_<12hex><14base62>`（免费层拒收其他形状）。
-Project 同理，对应 `prj_<24hex>`。
+Project 同理，对应 32 位 hex（v2 形状）。
 
 ## 开发
 

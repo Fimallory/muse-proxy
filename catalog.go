@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,10 +58,17 @@ func (p Protocol) Path() string {
 
 // catalog resolves model -> native protocol from the public capability
 // directory (the same file the OpenCode client fetches at startup):
-// model.provider.npm ?? provider.npm, then npm -> protocol.
+// model.provider.npm ?? provider.npm, then npm -> protocol. It also
+// tracks which models are free (cost.input == 0) and the suffix-stripped
+// names a free-only gateway exposes.
 type catalog struct {
-	mu      sync.RWMutex
-	table   map[string]Protocol
+	mu    sync.RWMutex
+	table map[string]Protocol
+	// free marks real model ids that carry no charge.
+	free map[string]bool
+	// alias maps an exposed (suffix-stripped) name back to its real id.
+	// Consulted only in free-only mode, where it also wins over table.
+	alias   map[string]string
 	updated time.Time
 	source  string // "live" | "disk" | "none"
 	path    string
@@ -73,11 +81,15 @@ type catalog struct {
 type catalogDisk struct {
 	Updated int64             `json:"updated"`
 	Table   map[string]string `json:"table"`
+	Free    []string          `json:"free,omitempty"`
+	Alias   map[string]string `json:"alias,omitempty"`
 }
 
 func openCatalog(path, url string, refresh time.Duration) *catalog {
 	c := &catalog{
 		table:   make(map[string]Protocol),
+		free:    make(map[string]bool),
+		alias:   make(map[string]string),
 		source:  "none",
 		path:    path,
 		url:     url,
@@ -90,6 +102,16 @@ func openCatalog(path, url string, refresh time.Duration) *catalog {
 			for m, p := range disk.Table {
 				if pp := Protocol(p); pp == ProtoChat || pp == ProtoResponses || pp == ProtoMessages || pp == ProtoGoogle {
 					c.table[m] = pp
+				}
+			}
+			for _, id := range disk.Free {
+				if _, ok := c.table[id]; ok {
+					c.free[id] = true
+				}
+			}
+			for ex, real := range disk.Alias {
+				if _, ok := c.table[real]; ok {
+					c.alias[ex] = real
 				}
 			}
 			c.updated = time.Unix(disk.Updated, 0)
@@ -110,6 +132,55 @@ func (c *catalog) resolve(model string) (Protocol, bool) {
 	defer c.mu.RUnlock()
 	p, ok := c.table[model]
 	return p, ok
+}
+
+// exposedModelName is the client-facing name of a free model: the literal
+// "-free" suffix is dropped so callers never see it.
+func exposedModelName(id string) string {
+	return strings.TrimSuffix(id, "-free")
+}
+
+// isFree reports whether a real model id carries no charge.
+func (c *catalog) isFree(model string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.free[model]
+}
+
+// aliasOf resolves an exposed (suffix-stripped) name back to the real id.
+func (c *catalog) aliasOf(model string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	real, ok := c.alias[model]
+	return real, ok
+}
+
+// hasFreeInfo reports whether the free set is populated. An empty set
+// means the filter must be skipped rather than hide every model.
+func (c *catalog) hasFreeInfo() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.free) > 0
+}
+
+// freeCount is the number of known free models.
+func (c *catalog) freeCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.free)
+}
+
+// freeModelNames returns the exposed names of every known free model,
+// sorted for a stable listing.
+func (c *catalog) freeModelNames() []string {
+	c.mu.RLock()
+	names := make([]string, 0, len(c.free))
+	for id := range c.free {
+		names = append(names, exposedModelName(id))
+	}
+	c.mu.RUnlock()
+	sort.Strings(names)
+	return names
 }
 
 func (c *catalog) snapshot() (entries int, updated int64, source string) {
@@ -174,6 +245,7 @@ func (c *catalog) refreshNow() {
 				NPM string `json:"npm"`
 				API string `json:"api"`
 			} `json:"provider"`
+			Cost json.RawMessage `json:"cost"`
 		} `json:"models"`
 	}
 	dec := json.NewDecoder(resp.Body)
@@ -182,6 +254,8 @@ func (c *catalog) refreshNow() {
 		return
 	}
 	table := make(map[string]Protocol)
+	free := make(map[string]bool)
+	alias := make(map[string]string)
 	for _, provKey := range []string{"opencode", "opencode-go"} {
 		prov, ok := raw[provKey]
 		if !ok {
@@ -205,6 +279,18 @@ func (c *catalog) refreshNow() {
 				continue
 			}
 			table[id] = p
+			if !costIsFree(m.Cost) {
+				continue
+			}
+			free[id] = true
+			// Expose free models without their "-free" suffix. The
+			// alias wins over a same-named paid model in free-only mode
+			// (e.g. minimax-m2.5-free and minimax-m2.5 differ in protocol).
+			if ex := exposedModelName(id); ex != id {
+				if _, dup := alias[ex]; !dup {
+					alias[ex] = id
+				}
+			}
 		}
 	}
 	if len(table) == 0 {
@@ -213,18 +299,62 @@ func (c *catalog) refreshNow() {
 	}
 	c.mu.Lock()
 	c.table = table
+	c.free = free
+	c.alias = alias
 	c.updated = time.Now()
 	c.source = "live"
 	c.mu.Unlock()
 	c.save()
-	log.Printf("catalog refreshed: %d models (live)", len(table))
+	log.Printf("catalog refreshed: %d models, %d free (live)", len(table), len(free))
+}
+
+// costIsFree reports whether a directory cost entry carries no charge.
+// The directory encodes cost as an object (an array of tiers is also
+// accepted); a model is free when no tier prices input above zero. A
+// missing or null cost block is treated as paid, since free cannot be
+// confirmed from it.
+func costIsFree(raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return !hasPositiveInput(obj)
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		for _, e := range arr {
+			if hasPositiveInput(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func hasPositiveInput(m map[string]any) bool {
+	v, ok := m["input"].(float64)
+	return ok && v > 0
 }
 
 func (c *catalog) save() {
 	c.mu.RLock()
-	disk := catalogDisk{Updated: c.updated.Unix(), Table: make(map[string]string, len(c.table))}
+	disk := catalogDisk{
+		Updated: c.updated.Unix(),
+		Table:   make(map[string]string, len(c.table)),
+		Free:    make([]string, 0, len(c.free)),
+		Alias:   make(map[string]string, len(c.alias)),
+	}
 	for m, p := range c.table {
 		disk.Table[m] = string(p)
+	}
+	for id := range c.free {
+		disk.Free = append(disk.Free, id)
+	}
+	sort.Strings(disk.Free)
+	for ex, real := range c.alias {
+		disk.Alias[ex] = real
 	}
 	c.mu.RUnlock()
 	data, err := json.Marshal(disk)

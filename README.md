@@ -133,8 +133,8 @@ A source entry:
 |---|---|---|
 | `listen` | `127.0.0.1:8080` | API listen address |
 | `server_keys` | (required) | local client keys |
-| `zen_key` | (required) | upstream Zen credential (`public` works for free models) |
-| `upstream` | `https://opencode.ai/zen` | Zen base URL |
+| `zen_key` | `public` | upstream Zen credential (`public` for free models, `oc_sk-…` for paid) |
+| `upstream` | `https://opencode.ai/inference` | Zen base URL (legacy `/zen` is auto-migrated) |
 | `proxies` | `["direct"]` | egress pool: `direct`, `http(s)://`, `socks5(h)://` (URL credentials OK) |
 | `reuse_proxy_connections` | `false` | only enable for a fixed single-node proxy; pools need fresh dials to rotate |
 | `prefer_direct` | `true` | try local egress first, fail over to pool on 429/5xx/transport errors |
@@ -151,6 +151,7 @@ A source entry:
 | `catalog_url` | `https://models.opencode.ai/api.json` | capability directory |
 | `catalog_path` | `./catalog.json` | persisted model→protocol table |
 | `catalog_refresh_hours` | `24` | refresh interval (failures keep the old table) |
+| `free_only` | `false` | expose free models only: paid models are hidden from `/v1/models`, free models lose their `-free` suffix, and requests for paid models are refused |
 | `request_timeout_seconds` | `600` | total budget per request, attempts included |
 
 `LISTEN` env overrides `listen`. Unknown JSON fields are rejected.
@@ -161,7 +162,7 @@ Precedence: explicit `x-opencode-session` / `x-session-affinity` /
 `X-Session-Id` headers → `metadata.session_id` → hash-store match →
 freshly minted. Non-canonical IDs are hashed into the official
 `ses_<12hex><14base62>` shape (the free tier rejects anything else).
-Projects resolve the same way into `prj_<24hex>`.
+Projects resolve the same way into 32-hex (the v2 shape).
 
 ## Development
 
