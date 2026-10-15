@@ -13,8 +13,8 @@
    - 可被 OPENCODE_DISABLE_MODELS_FETCH 禁用
    - 缓存到本地 Global.Path.cache/models.json（多 CLI 进程用 flock 互斥写）
 2. npm = model.provider.npm ?? provider.npm
-   - opencode (Zen): 默认 @ai-sdk/openai-compatible, api=https://opencode.ai/zen/v1
-   - opencode-go:    默认 @ai-sdk/openai-compatible, api=https://opencode.ai/zen/go/v1
+   - opencode (Zen): 默认 @ai-sdk/openai-compatible, api=https://opencode.ai/inference/v1（v2.0.29 起；旧 `/zen/v1` 为迁移路径，门禁更严）
+   - opencode-go:    默认 @ai-sdk/openai-compatible, api=https://opencode.ai/inference/go/v1
 3. npm → SDK → 线协议:
    - @ai-sdk/openai            → Responses API  (POST /v1/responses)
    - @ai-sdk/openai-compatible → Chat Completions (POST /v1/chat/completions)

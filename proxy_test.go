@@ -293,8 +293,38 @@ func TestFailoverDirect429ToPool(t *testing.T) {
 	}
 }
 
-// TestStoreTTL verifies expiry without waiting days.
+// TestFreshSessionIDShape guards the v2.0.29 session contract: minted
+// sessions must carry the canonical shape with a tiny embedded counter
+// (live-bisected: counter 32 passes, 64 is rejected with 403).
+func TestFreshSessionIDShape(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		id := FreshSessionID()
+		if !canonicalSessionPattern.MatchString(id) {
+			t.Fatalf("fresh session has wrong shape: %q", id)
+		}
+		ctr, ok := sessionCounter(id)
+		if !ok || ctr < 1 || ctr > maxSessionCounter {
+			t.Fatalf("fresh session counter out of range: %q -> %d,%v", id, ctr, ok)
+		}
+	}
+}
+
+// TestStoredSessionUsable rejects legacy hash-minted sessions (random
+// counter) while accepting genuinely minted ones.
+func TestStoredSessionUsable(t *testing.T) {
+	if !storedSessionUsable(mintSessionID(time.Now().UnixMilli(), 1)) {
+		t.Fatal("freshly minted session must be reusable")
+	}
+	// Fixed vector: time part abcdef123456 -> counter (~0x456)&0xFFF = 2985.
+	if storedSessionUsable("ses_abcdef123456ABCDEF12345678") {
+		t.Fatal("hash-style session with a large counter must not be reused")
+	}
+	if storedSessionUsable("garbage") {
+		t.Fatal("non-canonical session must not be reused")
+	}
+}
 func TestStoreTTL(t *testing.T) {
+	// Verifies expiry without waiting days.
 	store, err := openStore(t.TempDir()+"/h.json", time.Millisecond, 100)
 	if err != nil {
 		t.Fatal(err)

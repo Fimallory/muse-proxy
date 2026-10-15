@@ -615,10 +615,12 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 		} else {
 			session = FreshSessionID()
 		}
-	case stored != nil && canonicalSessionPattern.MatchString(stored.Session):
-		// Reuse only sessions that still carry a valid shape; hash-based
-		// legacy entries have random time-parts and are rejected now.
-		// Freshness is not checked here (store TTL bounds staleness).
+	case stored != nil && storedSessionUsable(stored.Session):
+		// Reuse only sessions whose embedded counter is tiny: legacy
+		// hash-minted entries carry a random counter and the v2.0.29
+		// gate rejects them with 403 (live-bisected: counter 32 passes,
+		// 64 fails). Anything else is re-minted fresh below and the
+		// store entry is overwritten.
 		session = stored.Session
 	default:
 		// v2.0.29 checks the embedded timestamp for freshness: every

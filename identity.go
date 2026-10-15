@@ -51,27 +51,42 @@ func CanonicalSessionID(signal string) string {
 
 // sessionClock replicates packages/schema/src/identifier.ts create(true):
 // per-ms counter so same-ms requests don't collide. The first 12 hex
-// chars are time-ordered descending data (~(timestamp*0x1000+counter));
-// the gate checks them for freshness since v2.0.29.
+// chars are time-ordered descending data (~(timestamp*0x1000+counter)).
+// Measured against the live v2.0.29 gate: the embedded counter must stay
+// tiny (1..32 pass, 64+ is rejected with 403), so a same-ms burst waits
+// for the next millisecond instead of minting a doomed session.
 var sessionClock struct {
 	sync.Mutex
 	last int64
 	ctr  uint64
 }
 
+// maxSessionCounter caps the per-millisecond counter: live-bisected
+// against the v2.0.29 free-tier gate (32 passes, 64 fails).
+const maxSessionCounter = 8
+
 // FreshSessionID mints a genuine time-ordered descending session ID,
 // indistinguishable from what opencode 2.0.29 generates locally.
 func FreshSessionID() string {
-	now := time.Now().UnixMilli()
-	sessionClock.Lock()
-	if now != sessionClock.last {
-		sessionClock.last = now
-		sessionClock.ctr = 0
+	for {
+		now := time.Now().UnixMilli()
+		sessionClock.Lock()
+		if now != sessionClock.last {
+			sessionClock.last = now
+			sessionClock.ctr = 0
+		}
+		if sessionClock.ctr < maxSessionCounter {
+			sessionClock.ctr++
+			ctr := sessionClock.ctr
+			sessionClock.Unlock()
+			return mintSessionID(now, ctr)
+		}
+		sessionClock.Unlock()
+		time.Sleep(time.Millisecond)
 	}
-	sessionClock.ctr++
-	ctr := sessionClock.ctr
-	sessionClock.Unlock()
+}
 
+func mintSessionID(now int64, ctr uint64) string {
 	current := uint64(now)*0x1000 + ctr
 	value := ^current
 	var timeBytes [6]byte
@@ -82,6 +97,37 @@ func FreshSessionID() string {
 	timePart := hex.EncodeToString(timeBytes[:])
 	randomPart := base62Random(14)
 	return "ses_" + timePart + randomPart
+}
+
+// sessionCounter extracts the embedded per-ms counter from a canonical
+// session id: counter = ~(low 12 bits of the time part).
+func sessionCounter(id string) (uint64, bool) {
+	if !canonicalSessionPattern.MatchString(id) {
+		return 0, false
+	}
+	var v uint64
+	for _, c := range id[4:16] {
+		var d uint64
+		switch {
+		case c >= '0' && c <= '9':
+			d = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = uint64(c-'a') + 10
+		default:
+			return 0, false
+		}
+		v = v*16 + d
+	}
+	return (^v) & 0xFFF, true
+}
+
+// storedSessionUsable reports whether a hash-store session is still safe
+// to send upstream. Legacy hash-minted sessions carry a random time part
+// (counter almost surely large) and the v2.0.29 gate rejects them, so
+// only sessions with a tiny embedded counter are reused.
+func storedSessionUsable(id string) bool {
+	ctr, ok := sessionCounter(id)
+	return ok && ctr >= 1 && ctr <= maxSessionCounter
 }
 
 // base62Random returns n random base62 chars from crypto/rand.
