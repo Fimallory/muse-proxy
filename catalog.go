@@ -237,25 +237,50 @@ func (c *catalog) refreshNow() {
 		return
 	}
 	// The directory is keyed by provider name at the top level.
-	var raw map[string]struct {
-		NPM    string `json:"npm"`
-		API    string `json:"api"`
-		Models map[string]struct {
-			Provider *struct {
-				NPM string `json:"npm"`
-				API string `json:"api"`
-			} `json:"provider"`
-			Cost json.RawMessage `json:"cost"`
-		} `json:"models"`
-	}
+	var raw catalogDirectory
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(&raw); err != nil {
 		log.Printf("catalog refresh: decode: %v", err)
 		return
 	}
-	table := make(map[string]Protocol)
-	free := make(map[string]bool)
-	alias := make(map[string]string)
+	table, free, alias := buildCatalogTable(raw)
+	if len(table) == 0 {
+		log.Printf("catalog refresh: empty table, keeping previous")
+		return
+	}
+	c.mu.Lock()
+	c.table = table
+	c.free = free
+	c.alias = alias
+	c.updated = time.Now()
+	c.source = "live"
+	c.mu.Unlock()
+	c.save()
+	log.Printf("catalog refreshed: %d models, %d free (live)", len(table), len(free))
+}
+
+// catalogDirectory mirrors the shape of models.opencode.ai/api.json.
+type catalogDirectory map[string]struct {
+	NPM    string `json:"npm"`
+	API    string `json:"api"`
+	Models map[string]struct {
+		Provider *struct {
+			NPM string `json:"npm"`
+			API string `json:"api"`
+		} `json:"provider"`
+		Cost   json.RawMessage `json:"cost"`
+		Status string          `json:"status"`
+	} `json:"models"`
+}
+
+// buildCatalogTable folds the capability directory into the routing table,
+// the free set and the suffix-stripped alias map. Retired models
+// (status "deprecated") are dropped outright, mirroring the OpenCode
+// client, which never lists them.
+func buildCatalogTable(raw catalogDirectory) (table map[string]Protocol, free map[string]bool, alias map[string]string) {
+	table = make(map[string]Protocol)
+	free = make(map[string]bool)
+	alias = make(map[string]string)
 	for _, provKey := range []string{"opencode", "opencode-go"} {
 		prov, ok := raw[provKey]
 		if !ok {
@@ -263,6 +288,9 @@ func (c *catalog) refreshNow() {
 		}
 		defProto := protocolOfNPM(prov.NPM)
 		for id, m := range prov.Models {
+			if strings.EqualFold(strings.TrimSpace(m.Status), "deprecated") {
+				continue
+			}
 			npm := prov.NPM
 			if m.Provider != nil && m.Provider.NPM != "" {
 				npm = m.Provider.NPM
@@ -293,19 +321,7 @@ func (c *catalog) refreshNow() {
 			}
 		}
 	}
-	if len(table) == 0 {
-		log.Printf("catalog refresh: empty table, keeping previous")
-		return
-	}
-	c.mu.Lock()
-	c.table = table
-	c.free = free
-	c.alias = alias
-	c.updated = time.Now()
-	c.source = "live"
-	c.mu.Unlock()
-	c.save()
-	log.Printf("catalog refreshed: %d models, %d free (live)", len(table), len(free))
+	return table, free, alias
 }
 
 // costIsFree reports whether a directory cost entry carries no charge.

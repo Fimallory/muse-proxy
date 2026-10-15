@@ -67,8 +67,42 @@ func testCatalog(t *testing.T) *catalog {
 	return c
 }
 
-// TestFreeAliasWinsOverPaidModel: the stripped name of a free model must
-// resolve to the free model even when a paid model shares that id (the
+// TestDeprecatedModelsDropped mirrors the OpenCode client: retired models
+// never enter the table, the free set or the alias map.
+func TestDeprecatedModelsDropped(t *testing.T) {
+	var raw catalogDirectory
+	if err := json.Unmarshal([]byte(`{"opencode":{
+		"npm":"@ai-sdk/openai-compatible",
+		"models":{
+			"mimo-v2.5-free":{"provider":{"npm":"@ai-sdk/openai-compatible"},"cost":{"input":0},"status":"deprecated"},
+			"exo-free":{"cost":{"input":0},"status":"Deprecated"},
+			"mimo-v2.6-flash-free":{"cost":{"input":0}},
+			"gpt-5":{"provider":{"npm":"@ai-sdk/openai"},"cost":{"input":1}}
+		}}}`), &raw); err != nil {
+		t.Fatal(err)
+	}
+	table, free, alias := buildCatalogTable(raw)
+	if _, ok := table["mimo-v2.5-free"]; ok {
+		t.Fatal("deprecated model must not be routed")
+	}
+	if _, ok := table["exo-free"]; ok {
+		t.Fatal("deprecated model must not be routed (case-insensitive)")
+	}
+	if free["mimo-v2.5-free"] || free["exo-free"] {
+		t.Fatal("deprecated models must not be free")
+	}
+	if _, ok := alias["mimo-v2.5"]; ok {
+		t.Fatal("deprecated models must not gain an alias")
+	}
+	if table["mimo-v2.6-flash-free"] != ProtoChat || !free["mimo-v2.6-flash-free"] {
+		t.Fatal("active free model lost")
+	}
+	if table["gpt-5"] != ProtoResponses || free["gpt-5"] {
+		t.Fatal("paid model mishandled")
+	}
+}
+
+// TestFreeAliasWinsOverPaidModel: the stripped name of a free model must// resolve to the free model even when a paid model shares that id (the
 // two can differ in protocol, e.g. minimax-m2.5 chat vs -free messages).
 func TestFreeAliasWinsOverPaidModel(t *testing.T) {
 	c := testCatalog(t)

@@ -137,7 +137,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `catalog_url` | `https://models.opencode.ai/api.json` | 能力目录 |
 | `catalog_path` | `./catalog.json` | 持久化的模型→协议表 |
 | `catalog_refresh_hours` | `24` | 刷新间隔（失败保留旧表） |
-| `free_only` | `false` | 只暴露免费模型：`/v1/models` 隐藏付费模型、free 模型去掉 `-free` 后缀，请求付费模型直接拒绝 |
+| `free_only` | `false` | 只暴露免费模型：`/v1/models` 隐藏付费及已下架（`deprecated`）模型、free 模型去掉 `-free` 后缀，请求付费模型直接拒绝 |
 | `request_timeout_seconds` | `600` | 单请求总预算（含全部尝试） |
 
 `LISTEN` 环境变量覆盖 `listen`。未知 JSON 字段直接拒绝。

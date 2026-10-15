@@ -151,7 +151,7 @@ A source entry:
 | `catalog_url` | `https://models.opencode.ai/api.json` | capability directory |
 | `catalog_path` | `./catalog.json` | persisted model→protocol table |
 | `catalog_refresh_hours` | `24` | refresh interval (failures keep the old table) |
-| `free_only` | `false` | expose free models only: paid models are hidden from `/v1/models`, free models lose their `-free` suffix, and requests for paid models are refused |
+| `free_only` | `false` | expose free models only: paid and retired (`deprecated`) models are hidden from `/v1/models`, free models lose their `-free` suffix, and requests for paid models are refused |
 | `request_timeout_seconds` | `600` | total budget per request, attempts included |
 
 `LISTEN` env overrides `listen`. Unknown JSON fields are rejected.
