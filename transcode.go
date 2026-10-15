@@ -47,6 +47,13 @@ func decodeChatResponse(p map[string]any, model string) *IRResponse {
 	}
 	msg := mobj(choice, "message")
 	ir.Text = mstr(msg, "content")
+	// Hidden thinking-chain summaries ride on the Chat extension field;
+	// keep them so conversion (and collapse) does not drop them.
+	if rc, ok := msg["reasoning_content"].(string); ok {
+		ir.Reasoning = rc
+	} else if rc, ok := msg["reasoning"].(string); ok {
+		ir.Reasoning = rc
+	}
 	for _, tc := range marr(msg, "tool_calls") {
 		tm, ok := tc.(map[string]any)
 		if !ok {

@@ -774,6 +774,12 @@ func decodeMessagesRequest(p map[string]any) *IRRequest {
 				switch bm["type"] {
 				case "text":
 					addText(mstr(bm, "text"))
+				case "thinking":
+					// Hidden thinking-chain summaries must survive
+					// conversion like any other content.
+					if t := mstr(bm, "thinking"); t != "" {
+						msg.Parts = append(msg.Parts, IRPart{Kind: "reasoning", Text: t})
+					}
 				case "image":
 					src := mobj(bm, "source")
 					switch mstr(src, "type") {

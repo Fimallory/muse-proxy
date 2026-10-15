@@ -161,6 +161,50 @@ func TestReasoningEffortMapping(t *testing.T) {
 	}
 }
 
+func TestReasoningSummaryPassthrough(t *testing.T) {
+	// Messages thinking blocks must survive request conversion.
+	ir := mustIR(t, ProtoMessages, `{"model":"m","messages":[
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"plan-A","signature":"sig"},
+			{"type":"text","text":"done"}]}]}`)
+	found := false
+	for _, m := range ir.Messages {
+		for _, p := range m.Parts {
+			if p.Kind == "reasoning" && p.Text == "plan-A" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("thinking summary lost: %+v", ir.Messages)
+	}
+	resp := encodeRequest(ProtoResponses, ir)
+	in, _ := resp["input"].([]any)
+	sawReason := false
+	for _, raw := range in {
+		it := raw.(map[string]any)
+		if it["type"] == "reasoning" {
+			sawReason = true
+		}
+	}
+	if !sawReason {
+		t.Fatalf("reasoning summary missing after messages->responses: %v", in)
+	}
+
+	// Chat reasoning_content must survive response conversion.
+	out, err := convertJSONResponse(ProtoChat, ProtoResponses,
+		[]byte(`{"id":"c","object":"chat.completion","created":1,"model":"m",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"hi","reasoning_content":"why-x"},
+			"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1}}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "why-x") {
+		t.Fatalf("chat reasoning_content lost: %s", out)
+	}
+}
+
 func TestToolChoiceMapping(t *testing.T) {
 	ir := &IRRequest{Model: "m", ToolChoice: "required"}
 	if mobj(encodeRequest(ProtoMessages, ir), "tool_choice")["type"] != "any" {
