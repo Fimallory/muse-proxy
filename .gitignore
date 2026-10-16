@@ -1,6 +1,9 @@
 # Binaries and build output
 muse-proxy
 muse-proxy.exe
+muse-proxy-e2e.exe
+muse-proxy-linux
+muse-proxy-fixed.exe~
 muse-proxy-test*
 *.test
 *.out
