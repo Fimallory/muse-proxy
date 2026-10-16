@@ -632,15 +632,11 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 	case stored != nil && stored.Project != "":
 		project = stored.Project
 	default:
-		// Derive a stable v2 project (32 hex) from the session so the
-		// same conversation reuses the same project upstream.
-		sum := contentHash(session, "", 10000)
-		// contentHash returns 64 hex; v2 projects are 32 hex.
-		if len(sum) >= 32 {
-			project = sum[:32]
-		} else {
-			project = CanonicalProjectID("content:" + hash)
-		}
+		// Derive a stable genuine-shaped project (40 hex sha1) from the
+		// session so the same conversation reuses the same project
+		// upstream, mirroring Hash.fast(`directory:…`) in
+		// packages/core/src/project.ts.
+		project = CanonicalProjectID("session:" + session)
 	}
 
 	if !textEmpty {

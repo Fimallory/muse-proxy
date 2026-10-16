@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -152,18 +153,20 @@ func StableID(prefix, value string) string {
 }
 
 // CanonicalProjectID returns signal unchanged when it already carries
-// an official v2 project shape (40 hex as genuine clients send; 32 hex
-// is accepted as well). Every other shape — legacy prj_<24hex>,
-// "global", names — is deterministically hashed into 32 hex so the same
-// conversation always maps to the same project and no legacy shape
-// reaches the v2 gate.
+// a genuine project shape: 40 hex (sha1 of the directory or git identity,
+// what real clients send), 32 hex (accepted), or the literal "global"
+// (Project.ID.global, the fallback real clients send when no identity
+// resolves). Every other shape — legacy prj_<24hex>, names — is hashed
+// with sha1 into 40 hex, mirroring Hash.fast in packages/util/src/hash.ts,
+// so the same conversation always maps to the same project and no legacy
+// shape reaches the v2 gate.
 func CanonicalProjectID(signal string) string {
 	s := strings.TrimSpace(signal)
-	if projectPattern.MatchString(s) {
+	if projectPattern.MatchString(s) || s == "global" {
 		return s
 	}
-	sum := sha256.Sum256([]byte("prj\x00" + s))
-	return hex.EncodeToString(sum[:16])
+	sum := sha1.Sum([]byte("prj\x00" + s))
+	return hex.EncodeToString(sum[:])
 }
 
 // RandomID mints a fresh prefixed hex ID.

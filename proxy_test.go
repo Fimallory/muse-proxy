@@ -381,8 +381,8 @@ func TestStoreTTL(t *testing.T) {
 	}
 }
 
-// TestCanonicalProjectIDLegacy: legacy shapes must be normalized to v2
-// 32-hex, never passed through to the gate.
+// TestCanonicalProjectIDLegacy: legacy shapes must be normalized to the
+// genuine 40-hex sha1 shape (or "global" passthrough), never passed raw.
 func TestCanonicalProjectIDLegacy(t *testing.T) {
 	if got := CanonicalProjectID("513945e107b3e9bacde70050e755d4d65a49230d"); got != "513945e107b3e9bacde70050e755d4d65a49230d" {
 		t.Fatalf("v2 project must pass through: %q", got)
@@ -390,8 +390,14 @@ func TestCanonicalProjectIDLegacy(t *testing.T) {
 	if got := CanonicalProjectID("bb6b4a9bd0fadbc1b30211e9356834b5"); got != "bb6b4a9bd0fadbc1b30211e9356834b5" {
 		t.Fatalf("32-hex project must pass through: %q", got)
 	}
-	for _, in := range []string{"prj_df2e8a73b21362c40ae166b1", "global", "my-project"} {
+	if got := CanonicalProjectID("global"); got != "global" {
+		t.Fatalf("global project must pass through: %q", got)
+	}
+	for _, in := range []string{"prj_df2e8a73b21362c40ae166b1", "my-project"} {
 		got := CanonicalProjectID(in)
+		if len(got) != 40 {
+			t.Fatalf("CanonicalProjectID(%q) = %q, want 40-hex sha1", in, got)
+		}
 		if !projectPattern.MatchString(got) {
 			t.Fatalf("CanonicalProjectID(%q) = %q, not v2 shape", in, got)
 		}
