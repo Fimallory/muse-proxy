@@ -879,6 +879,11 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 			}
 			if i < attempts-1 {
 				closeResp(resp)
+				if err != nil {
+					log.Printf("egress pool %s via %s error: %v (%d/%d)", upPath, redactProxySource(t.name), err, i+1, attempts)
+				} else {
+					log.Printf("egress pool %s via %s -> %d (%d/%d)", upPath, redactProxySource(t.name), resp.StatusCode, i+1, attempts)
+				}
 				lastErr = err
 				continue
 			}
@@ -903,6 +908,11 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 			return resp, nil
 		}
 		if err != nil || shouldFailover(resp.StatusCode, nil) {
+			if err != nil {
+				log.Printf("egress direct %s error: %v, failing over to pool", upPath, err)
+			} else {
+				log.Printf("egress direct %s -> %d, failing over to pool", upPath, resp.StatusCode)
+			}
 			s.banDirect(resp, err)
 		}
 		if err == nil && s.pool.len() == 0 {
@@ -936,6 +946,11 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 		if !last {
 			// Another fresh dial follows; this body is useless.
 			closeResp(resp)
+			if err != nil {
+				log.Printf("egress pool %s via %s error: %v (%d/%d)", upPath, redactProxySource(t.name), err, i+1, attempts)
+			} else {
+				log.Printf("egress pool %s via %s -> %d (%d/%d)", upPath, redactProxySource(t.name), resp.StatusCode, i+1, attempts)
+			}
 			lastErr = err
 			continue
 		}
