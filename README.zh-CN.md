@@ -147,7 +147,7 @@ curl http://localhost:8080/v1/chat/completions \
 优先级：显式 `x-opencode-session` / `x-session-affinity` /
 `X-Session-Id` 头 → `metadata.session_id` → hash 库命中 → 现场生成。
 非规范形状一律哈希成官方 `ses_<12hex><14base62>`（免费层拒收其他形状）。
-Project 同理，对应 32 位 hex（v2 形状）。
+Project 同理，对应 40 位 hex（32 位亦可）；其他形状一律哈希成形，绝不透传。
 
 ## 开发
 

@@ -162,7 +162,8 @@ Precedence: explicit `x-opencode-session` / `x-session-affinity` /
 `X-Session-Id` headers → `metadata.session_id` → hash-store match →
 freshly minted. Non-canonical IDs are hashed into the official
 `ses_<12hex><14base62>` shape (the free tier rejects anything else).
-Projects resolve the same way into 32-hex (the v2 shape).
+Projects resolve the same way into 40-hex (32-hex accepted); anything
+else is hashed into shape, never passed through.
 
 ## Development
 

@@ -15,18 +15,19 @@ import (
 
 // Identity helpers. Session/project shapes mirror what the Zen free tier
 // accepts in v2 (captured 2.0.29):
-//   session: ses_<12 hex><14 base62> (prompt_cache_key carries the same)
-//   project: 32 hex, no prefix (e.g. 513945e107b3e9bacde70050e755d4d65a49230d)
-// Anything else is hashed into shape instead of being passed through.
+//   session: ses_<12 hex><14 base62> with a tiny embedded counter
+//     (prompt_cache_key carries the same)
+//   project: 40 hex, no prefix (e.g. 513945e107b3e9bacde70050e755d4d65a49230d;
+//     32 hex is accepted as well)
+// Anything else is re-minted (sessions) or hashed (projects) into shape
+// instead of being passed through.
 
 // canonicalSessionPattern matches OpenCode's canonical session format.
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 
-// projectPattern matches the v2 project shape: 32 hex chars, no prefix.
-// The legacy prj_<24hex> shape is still accepted and passed through so
-// old hash-store entries keep working, but new IDs are minted as 32 hex.
-var projectPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
-var legacyProjectPattern = regexp.MustCompile(`^prj_[0-9a-f]{24}$`)
+// projectPattern matches the v2 project shapes observed live: 40 hex
+// (what genuine clients send) and 32 hex (accepted as well).
+var projectPattern = regexp.MustCompile(`^([0-9a-f]{32}|[0-9a-f]{40})$`)
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -150,16 +151,15 @@ func StableID(prefix, value string) string {
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
-// CanonicalProjectID returns signal unchanged when it already carries an
-// official v2 project shape (32 hex) or the legacy prj_<24hex> shape.
-// Anything else is deterministically hashed into the v2 32-hex shape so
-// the same conversation always maps to the same project.
+// CanonicalProjectID returns signal unchanged when it already carries
+// an official v2 project shape (40 hex as genuine clients send; 32 hex
+// is accepted as well). Every other shape — legacy prj_<24hex>,
+// "global", names — is deterministically hashed into 32 hex so the same
+// conversation always maps to the same project and no legacy shape
+// reaches the v2 gate.
 func CanonicalProjectID(signal string) string {
 	s := strings.TrimSpace(signal)
-	if projectPattern.MatchString(s) || legacyProjectPattern.MatchString(s) {
-		return s
-	}
-	if s == "" || s == "global" {
+	if projectPattern.MatchString(s) {
 		return s
 	}
 	sum := sha256.Sum256([]byte("prj\x00" + s))

@@ -380,3 +380,51 @@ func TestStoreTTL(t *testing.T) {
 		t.Fatalf("expired entry must be purged, count=%d", n)
 	}
 }
+
+// TestCanonicalProjectIDLegacy: legacy shapes must be normalized to v2
+// 32-hex, never passed through to the gate.
+func TestCanonicalProjectIDLegacy(t *testing.T) {
+	if got := CanonicalProjectID("513945e107b3e9bacde70050e755d4d65a49230d"); got != "513945e107b3e9bacde70050e755d4d65a49230d" {
+		t.Fatalf("v2 project must pass through: %q", got)
+	}
+	if got := CanonicalProjectID("bb6b4a9bd0fadbc1b30211e9356834b5"); got != "bb6b4a9bd0fadbc1b30211e9356834b5" {
+		t.Fatalf("32-hex project must pass through: %q", got)
+	}
+	for _, in := range []string{"prj_df2e8a73b21362c40ae166b1", "global", "my-project"} {
+		got := CanonicalProjectID(in)
+		if !projectPattern.MatchString(got) {
+			t.Fatalf("CanonicalProjectID(%q) = %q, not v2 shape", in, got)
+		}
+		if got == in {
+			t.Fatalf("legacy project %q must not pass through", in)
+		}
+	}
+	if CanonicalProjectID("prj_df2e8a73b21362c40ae166b1") != CanonicalProjectID("prj_df2e8a73b21362c40ae166b1") {
+		t.Fatal("project mapping must be deterministic")
+	}
+}
+
+// TestResolveIDsRejectsPinnedStaleSession: an explicit session with a
+// blown counter (e.g. the pre-v2 hash-minted ses_3f691b09… with counter
+// 3715 that caused a live 403 loop) must be re-minted, not preserved.
+func TestResolveIDsRejectsPinnedStaleSession(t *testing.T) {
+	store, err := openStore(t.TempDir()+"/h.json", time.Hour, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	s := &Server{cfg: &Config{HashPrefixChars: 10000}, store: store}
+	r := httptest.NewRequest("POST", "/v1/responses", nil)
+	r.Header.Set("x-opencode-session", "ses_3f691b09d17c0BdPzfWm9bI7Kv")
+	r.Header.Set("x-opencode-project", "prj_df2e8a73b21362c40ae166b1")
+	sess, proj := s.resolveIDs(r, []byte(`{"model":"m"}`), "abc", false)
+	if sess == "ses_3f691b09d17c0BdPzfWm9bI7Kv" {
+		t.Fatal("stale pinned session must be re-minted")
+	}
+	if ctr, ok := sessionCounter(sess); !ok || ctr < 1 || ctr > maxSessionCounter {
+		t.Fatalf("re-minted session unusable: %q", sess)
+	}
+	if !projectPattern.MatchString(proj) {
+		t.Fatalf("legacy project must be normalized to v2: %q", proj)
+	}
+}

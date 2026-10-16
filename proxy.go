@@ -499,7 +499,7 @@ func (s *Server) handleProto(w http.ResponseWriter, r *http.Request, clientProto
 	//   x-opencode-client: cli
 	//   x-opencode-session / x-opencode-session-id / x-session-affinity /
 	//     x-session-id / X-Session-Id: all carry the same ses_ value
-	//   x-opencode-project: 32 hex (no prj_ prefix)
+	//   x-opencode-project: 40 hex, no prefix (32 hex accepted)
 	//   Authorization: Bearer public is sent (stripped to anonymous
 	//     upstream by inference-proxy); no x-opencode-request headers —
 	//     genuine v2 sends b3/traceparent instead (forwarded untouched
@@ -593,16 +593,18 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 
 	switch {
 	case explicitSess != "":
-		// Preserve genuine client sessions (time-ordered, fresh).
-		// Non-canonical signals are NOT hashed (hash time-parts are
-		// random and rejected since v2.0.29): mint fresh instead.
-		if canonicalSessionPattern.MatchString(strings.TrimSpace(explicitSess)) {
+		// Preserve genuine client sessions, but only when their
+		// embedded counter is tiny (live-bisected: 32 passes, 64 is
+		// rejected). Stale clients pin dead sessions forever (e.g. a
+		// pre-v2 hash-minted id with counter 3715); those are re-minted
+		// fresh instead of passed through to a certain 403.
+		if storedSessionUsable(strings.TrimSpace(explicitSess)) {
 			session = strings.TrimSpace(explicitSess)
 		} else {
 			session = FreshSessionID()
 		}
 	case metaSess != "":
-		if canonicalSessionPattern.MatchString(strings.TrimSpace(metaSess)) {
+		if storedSessionUsable(strings.TrimSpace(metaSess)) {
 			session = strings.TrimSpace(metaSess)
 		} else {
 			session = FreshSessionID()
@@ -615,8 +617,8 @@ func (s *Server) resolveIDs(r *http.Request, body []byte, hash string, textEmpty
 		// store entry is overwritten.
 		session = stored.Session
 	default:
-		// v2.0.29 checks the embedded timestamp for freshness: every
-		// minted session must be time-ordered now, not content-hashed.
+		// v2.0.29 checks the embedded session counter: every minted
+		// session must be time-ordered now, not content-hashed.
 		// Stability across retries is sacrificed for passing the gate;
 		// genuine clients (explicit headers) still pin their session.
 		session = FreshSessionID()
