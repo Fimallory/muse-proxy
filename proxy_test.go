@@ -244,22 +244,16 @@ func TestFailoverClassification(t *testing.T) {
 	if !shouldFailover(429, nil) || !shouldFailover(500, nil) || !shouldFailover(503, nil) {
 		t.Fatal("429/5xx must fail over")
 	}
-	if !shouldFailover(403, nil) {
-		t.Fatal("403 must fail over (egress-sensitive since v2.0.29)")
-	}
 	if !shouldFailover(0, errTest) {
 		t.Fatal("transport error must fail over")
 	}
-	for _, s := range []int{400, 401, 404, 422} {
+	for _, s := range []int{400, 401, 403, 404, 422} {
 		if shouldFailover(s, nil) {
 			t.Fatalf("%d must not fail over", s)
 		}
 		if !deterministic4xx(s) {
 			t.Fatalf("%d must be deterministic", s)
 		}
-	}
-	if deterministic4xx(403) {
-		t.Fatal("403 must not be deterministic (fails over to pool)")
 	}
 	if deterministic4xx(429) || deterministic4xx(500) {
 		t.Fatal("429/500 are not deterministic")

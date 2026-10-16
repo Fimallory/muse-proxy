@@ -151,31 +151,26 @@ func (s *Server) close() {}
 
 // deterministic4xx reports request shapes the upstream will always reject
 // regardless of egress: retrying them through another route cannot help.
-// NOTE (v2.0.29): 403 FreeTierError is egress-sensitive (IP/PoP abuse
-// protection) — a different egress node may still return 200 — so 403 is
-// deliberately NOT deterministic and fails over to the pool.
+// 403 stays deterministic: live-bisected evidence shows free-tier 403s are
+// request-shape verdicts, and failing them over to the pool only turns a
+// fast refusal into a slow one (slow pool dials) plus a direct-route ban,
+// which is exactly how a single refusal becomes a client-side timeout.
 func deterministic4xx(status int) bool {
-	if status == http.StatusForbidden {
-		return false
-	}
 	return status >= 400 && status < 500 && status != http.StatusTooManyRequests
 }
 
 // shouldFailover reports whether a failed direct attempt is worth retrying
-// through the pool: transport errors, rate limits, server errors, and 403
-// (free-tier gate may clear on a different egress IP/PoP since v2.0.29).
+// through the pool: transport errors, rate limits and server errors.
 func shouldFailover(status int, err error) bool {
 	if err != nil {
 		return true
 	}
-	return status == http.StatusTooManyRequests || status == http.StatusForbidden || status >= 500
+	return status == http.StatusTooManyRequests || status >= 500
 }
 
 // banDirect takes the direct route out of rotation for a while:
 // a throttled route stays out for DirectCooldown (or longer when the
 // upstream names a Retry-After); a broken route gets a brief backoff.
-// A 403 free-tier refusal also cools direct down briefly so the pool
-// (different egress) gets a chance; the gate may clear there.
 func (s *Server) banDirect(resp *http.Response, err error) {
 	var cd time.Duration
 	if err != nil {
@@ -186,9 +181,6 @@ func (s *Server) banDirect(resp *http.Response, err error) {
 		if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > cd {
 			cd = ra
 		}
-	}
-	if resp != nil && resp.StatusCode == http.StatusForbidden {
-		cd = 30 * time.Second
 	}
 	if cd > 0 {
 		s.banUntil.Store(time.Now().Add(cd).UnixNano())
@@ -744,8 +736,8 @@ func (s *Server) forwardStreaming(ctx context.Context, w http.ResponseWriter, r 
 			w.WriteHeader(resp.StatusCode)
 			streamCopy(w, resp.Body)
 			resp.Body.Close()
-			log.Printf("%s %s -> %d %s%dms sess=%s", r.Method, upPath, resp.StatusCode,
-				conv, time.Since(start).Milliseconds(), shortID(session))
+			log.Printf("%s %s -> %d %s%dms model=%s sess=%s", r.Method, upPath, resp.StatusCode,
+				conv, time.Since(start).Milliseconds(), model, shortID(session))
 			return
 		}
 		committed, empty, serr := s.streamGuarded(w, resp, native, client, model, upPath,
@@ -756,8 +748,8 @@ func (s *Server) forwardStreaming(ctx context.Context, w http.ResponseWriter, r 
 			if empty {
 				note = "empty "
 			}
-			log.Printf("%s %s -> %d %s%s%dms sess=%s", r.Method, upPath, resp.StatusCode,
-				conv, note, time.Since(start).Milliseconds(), shortID(session))
+			log.Printf("%s %s -> %d %s%s%dms model=%s sess=%s", r.Method, upPath, resp.StatusCode,
+				conv, note, time.Since(start).Milliseconds(), model, shortID(session))
 			return
 		}
 		if serr != nil {
