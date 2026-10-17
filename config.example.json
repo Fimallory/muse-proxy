@@ -58,15 +58,6 @@
       "refresh_hours": 3
     },
     {
-      "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-      "protocol": "socks5",
-      "test_url": "https://opencode.ai/inference/v1/models",
-      "timeout_seconds": 8,
-      "concurrency": 48,
-      "max_keep": 200,
-      "refresh_hours": 3
-    },
-    {
       "url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
       "protocol": "http",
       "test_url": "https://opencode.ai/inference/v1/models",
