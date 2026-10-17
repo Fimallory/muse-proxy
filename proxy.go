@@ -1023,7 +1023,7 @@ func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool) {
 		// Probes are sorted by latency; keep the fastest MaxKeep nodes.
 		live = live[:src.MaxKeep]
 	}
-	pool.replace(live)
+	pool.replaceSource(src.URL, live, dead)
 	log.Printf("proxy source %s: %d checked -> %d live, %d rejected in %s",
 		redactProxySource(src.URL), tested, len(live), dead, time.Since(start).Round(time.Millisecond))
 }

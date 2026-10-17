@@ -25,8 +25,15 @@ import (
 // read the current generation atomically, so a refresh never blocks
 // in-flight requests.
 type proxyPool struct {
-	mu    sync.RWMutex
-	items []*proxyTransport
+	mu sync.RWMutex
+	// items is the flattened rotation list. bySource keeps each
+	// subscription's live nodes separately so a refresh of one source
+	// never drops the nodes another source contributed; order preserves
+	// first-seen source order for a stable flattening.
+	items    []*proxyTransport
+	bySource map[string][]*proxyTransport
+	dead     map[string]int
+	order    []string
 	// cursor walks items so consecutive requests spread across nodes.
 	cursor atomic.Uint64
 	// stats for /healthz
@@ -38,7 +45,7 @@ type proxyPool struct {
 }
 
 func newProxyPool() *proxyPool {
-	return &proxyPool{}
+	return &proxyPool{bySource: map[string][]*proxyTransport{}, dead: map[string]int{}}
 }
 
 func (p *proxyPool) snapshot() []*proxyTransport {
@@ -63,11 +70,46 @@ func (p *proxyPool) next() *proxyTransport {
 	return items[i]
 }
 
+// replace installs a whole pool at once (static inline proxies and tests).
+// Subscription sources must use replaceSource so they do not evict each
+// other.
 func (p *proxyPool) replace(items []*proxyTransport) {
 	p.mu.Lock()
+	p.bySource = map[string][]*proxyTransport{}
+	p.dead = map[string]int{}
+	p.order = nil
 	p.items = items
 	p.mu.Unlock()
 	p.liveCount.Store(int64(len(items)))
+	p.deadCount.Store(0)
+}
+
+// replaceSource installs one subscription's live nodes and rebuilds the
+// rotation list from every source. dead is this source's rejected count
+// for the round, summed across sources for /healthz.
+func (p *proxyPool) replaceSource(key string, items []*proxyTransport, dead int) {
+	p.mu.Lock()
+	if p.bySource == nil {
+		p.bySource = map[string][]*proxyTransport{}
+	}
+	if p.dead == nil {
+		p.dead = map[string]int{}
+	}
+	if _, seen := p.bySource[key]; !seen {
+		p.order = append(p.order, key)
+	}
+	p.bySource[key] = items
+	p.dead[key] = dead
+	all := make([]*proxyTransport, 0, len(p.items)+len(items))
+	deadTotal := 0
+	for _, k := range p.order {
+		all = append(all, p.bySource[k]...)
+		deadTotal += p.dead[k]
+	}
+	p.items = all
+	p.mu.Unlock()
+	p.liveCount.Store(int64(len(all)))
+	p.deadCount.Store(int64(deadTotal))
 }
 
 // proxyStats feeds the health endpoint.

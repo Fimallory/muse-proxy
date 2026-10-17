@@ -65,6 +65,40 @@ func TestParseProxyLines(t *testing.T) {
 	}
 }
 
+// TestProxyPoolMergeSources: refreshing one source must keep the nodes
+// other sources contributed; a whole-pool replace would evict them.
+func TestProxyPoolMergeSources(t *testing.T) {
+	p := newProxyPool()
+	mk := func(name string) *proxyTransport {
+		return &proxyTransport{name: name, client: &http.Client{}}
+	}
+	p.replaceSource("a", []*proxyTransport{mk("a1"), mk("a2")}, 3)
+	p.replaceSource("b", []*proxyTransport{mk("b1")}, 5)
+	if p.len() != 3 {
+		t.Fatalf("merge lost nodes: len=%d", p.len())
+	}
+	// Refreshing "a" must not drop "b".
+	p.replaceSource("a", []*proxyTransport{mk("a3")}, 1)
+	if p.len() != 2 {
+		t.Fatalf("refresh dropped another source: len=%d", p.len())
+	}
+	names := map[string]bool{}
+	for _, it := range p.snapshot() {
+		names[it.name] = true
+	}
+	if !names["a3"] || !names["b1"] || names["a1"] {
+		t.Fatalf("unexpected contents: %v", names)
+	}
+	if st := p.stats(); st.Live != 2 || st.Rejected != 6 {
+		t.Fatalf("stats wrong: %+v", st)
+	}
+	// replace() installs a whole pool and clears per-source state.
+	p.replace([]*proxyTransport{mk("solo")})
+	if p.len() != 1 || p.stats().Rejected != 0 {
+		t.Fatalf("replace must reset: len=%d stats=%+v", p.len(), p.stats())
+	}
+}
+
 func TestProxyPoolRoundRobin(t *testing.T) {
 	p := newProxyPool()
 	mk := func(name string) *proxyTransport {
