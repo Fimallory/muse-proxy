@@ -46,7 +46,9 @@ it converts.
   to one node), with ALPN pinned to HTTP/1.1
 - **Subscription pools**: point `proxy_sources` at plaintext proxy lists;
   every source is fetched, health-checked concurrently and filtered at
-  startup (and on schedule), so dead nodes never enter rotation
+  startup (and on schedule), so dead nodes never enter rotation. Public
+  lists and private subscriptions both work; each source carries its own
+  protocol, timeout, concurrency, keep-cap and refresh interval.
 - **Empty-reply guard**: 2xx answers with no text and no tool calls are
   retried internally on a fresh connection instead of passed through.
   Streaming stays live: only the prefix is held, and it is flushed as
@@ -140,7 +142,7 @@ A source entry:
 | `prefer_direct` | `true` | try local egress first, fail over to pool on 429/5xx/transport errors |
 | `direct_cooldown_seconds` | `120` | skip direct this long after a 429 (honors larger `Retry-After`) |
 | `pool_max_attempts` | `3` | retries through the pool per request (each a fresh connection) |
-| `proxy_sources` | `[]` | subscription URLs (one proxy per line); each source is fetched + health-checked at startup (blocking, max 3 min) and only live proxies join the pool |
+| `proxy_sources` | `[]` | subscription URLs (one proxy per line); each source is fetched + health-checked at startup (blocking, max 3 min) and only live proxies join the pool. Lines may be `scheme://host:port`, `host:port`, `host:port:label` (country suffix) or `ip:port:user:pass` |
 | `retry_empty` | `true` | drop empty 2xx replies instead of forwarding them; re-send internally |
 | `max_empty_retries` | `2` | extra internal attempts for empty replies (last reply forwarded even if empty) |
 | `empty_guard_timeout_seconds` | `30` | how long a streaming reply may be held while deciding it is non-empty; on expiry the held prefix is flushed and the stream goes live (`0` = wait for content or stream end) |

@@ -26,11 +26,13 @@ func TestParseProxyLines(t *testing.T) {
 		"http://user:pass@6.6.6.6:8080",
 		"7.7.7.7:9090",
 		"8.8.8.8:1234:user:pass",
-		"9.9.9.9:1080",         // scheme-less, default protocol
-		"http://1.1.1.1:8080",  // duplicate
-		"garbage line here",    // rejected
-		"ftp://10.0.0.1:21",    // unsupported scheme
-		"11.11.11.11:notaport", // accepted structurally (port validity is runtime)
+		"9.9.9.9:1080",                   // scheme-less, default protocol
+		"http://1.1.1.1:8080",            // duplicate
+		"garbage line here",              // rejected
+		"ftp://10.0.0.1:21",              // unsupported scheme
+		"11.11.11.11:notaport",           // accepted structurally (port validity is runtime)
+		"12.12.12.12:1080:United States", // host:port:label (country suffix)
+		"13.13.13.13:1080:9999",          // numeric third field: no known shape
 	}, "\n")
 
 	got := parseProxyLines(body, "http")
@@ -45,6 +47,7 @@ func TestParseProxyLines(t *testing.T) {
 		"http://user:pass@8.8.8.8:1234",
 		"http://9.9.9.9:1080",
 		"http://11.11.11.11:notaport",
+		"http://12.12.12.12:1080",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("count mismatch\n got: %v\nwant: %v", got, want)

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,10 +173,21 @@ func parseProxyLines(body, defaultProtocol string) []string {
 			}
 			continue
 		}
-		// Scheme-less: host:port or ip:port:user:pass
+		// Scheme-less shapes:
+		//   host:port
+		//   host:port:label     (e.g. hideip.me appends a country name)
+		//   ip:port:user:pass
 		parts := strings.Split(line, ":")
 		switch len(parts) {
 		case 2:
+			host, port = parts[0], parts[1]
+		case 3:
+			// A trailing non-numeric field is a label (country name),
+			// not a credential. A numeric third field matches no known
+			// shape, so the line is rejected rather than guessed at.
+			if _, err := strconv.Atoi(parts[2]); err == nil {
+				continue
+			}
 			host, port = parts[0], parts[1]
 		case 4:
 			host, port = parts[0], parts[1]
