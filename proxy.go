@@ -968,7 +968,7 @@ func (s *Server) roundTrip(ctx context.Context, r *http.Request, upPath string, 
 // waitProxySources runs the first fetch+check round for all sources and
 // blocks until each has either installed a pool or failed. The listener
 // opens afterwards so the first request sees a verified pool.
-func waitProxySources(ctx context.Context, cfg *Config, pool *proxyPool, maxWait time.Duration) {
+func waitProxySources(ctx context.Context, cfg *Config, pool *proxyPool, maxWait time.Duration, gate *gateProbeConfig) {
 	done := make(chan struct{})
 	go func() {
 		var wg sync.WaitGroup
@@ -978,7 +978,7 @@ func waitProxySources(ctx context.Context, cfg *Config, pool *proxyPool, maxWait
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				runProxySourceOnce(ctx, src, pool)
+				runProxySourceOnce(ctx, src, pool, gate)
 			}()
 		}
 		wg.Wait()
@@ -995,12 +995,12 @@ func waitProxySources(ctx context.Context, cfg *Config, pool *proxyPool, maxWait
 		if src.RefreshHours <= 0 {
 			continue
 		}
-		go runProxySourceLoop(ctx, src, pool)
+		go runProxySourceLoop(ctx, src, pool, gate)
 	}
 }
 
 // runProxySourceOnce performs one fetch + check + install round.
-func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool) {
+func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool, gate *gateProbeConfig) {
 	start := time.Now()
 	raw, err := fetchProxyList(ctx, src)
 	if err != nil {
@@ -1012,7 +1012,7 @@ func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool) {
 		log.Printf("proxy source %s: empty list, keeping previous pool", redactProxySource(src.URL))
 		return
 	}
-	live, tested, dead := checkProxyList(ctx, raw, src)
+	live, tested, dead := checkProxyList(ctx, raw, src, gate)
 	pool.lastChecked.Store(time.Now().Unix())
 	pool.deadCount.Store(int64(dead))
 	if len(live) == 0 {
@@ -1029,7 +1029,7 @@ func runProxySourceOnce(ctx context.Context, src ProxySource, pool *proxyPool) {
 }
 
 // runProxySourceLoop re-runs the fetch+check round on schedule.
-func runProxySourceLoop(ctx context.Context, src ProxySource, pool *proxyPool) {
+func runProxySourceLoop(ctx context.Context, src ProxySource, pool *proxyPool, gate *gateProbeConfig) {
 	ticker := time.NewTicker(time.Duration(src.RefreshHours * float64(time.Hour)))
 	defer ticker.Stop()
 	for {
@@ -1037,7 +1037,7 @@ func runProxySourceLoop(ctx context.Context, src ProxySource, pool *proxyPool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runProxySourceOnce(ctx, src, pool)
+			runProxySourceOnce(ctx, src, pool, gate)
 		}
 	}
 }

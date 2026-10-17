@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -144,9 +145,9 @@ func startProxyPools(ctx context.Context, cfg *Config, pool *proxyPool) {
 	for i := range cfg.ProxySources {
 		src := cfg.ProxySources[i]
 		go func() {
-			runProxySourceOnce(ctx, src, pool)
+			runProxySourceOnce(ctx, src, pool, nil)
 			if src.RefreshHours > 0 {
-				runProxySourceLoop(ctx, src, pool)
+				runProxySourceLoop(ctx, src, pool, nil)
 			}
 		}()
 	}
@@ -174,16 +175,20 @@ func fetchProxyList(ctx context.Context, src ProxySource) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseProxyLines(string(body), src.Protocol), nil
+	return parseProxyLines(string(body), src.Protocol, src.Country), nil
 }
 
 // parseProxyLines accepts any mix of http(s)://, socks5(h):// URLs,
-// host:port pairs, and IP:PORT:USER:PASS (plain HTTP proxy) lines.
-// Comments and blanks are ignored; results are deduplicated in order.
-func parseProxyLines(body, defaultProtocol string) []string {
+// host:port pairs, host:port:label lines and IP:PORT:USER:PASS (plain
+// HTTP proxy) lines. Comments and blanks are ignored; results are
+// deduplicated in order. When country is non-empty only lines carrying a
+// matching trailing label are kept, so a geo-labelled list can be
+// narrowed without a lookup service.
+func parseProxyLines(body, defaultProtocol, country string) []string {
 	if defaultProtocol == "" {
 		defaultProtocol = "http"
 	}
+	want := strings.ToLower(strings.TrimSpace(country))
 	seen := map[string]bool{}
 	var out []string
 	sc := bufio.NewScanner(strings.NewReader(body))
@@ -196,7 +201,11 @@ func parseProxyLines(body, defaultProtocol string) []string {
 		}
 		host, port := "", ""
 		rest := ""
+		label := ""
 		if strings.Contains(line, "://") {
+			if want != "" {
+				continue // no label to verify
+			}
 			u, err := url.Parse(strings.Fields(line)[0])
 			if err != nil || u.Host == "" {
 				continue
@@ -230,12 +239,17 @@ func parseProxyLines(body, defaultProtocol string) []string {
 			if _, err := strconv.Atoi(parts[2]); err == nil {
 				continue
 			}
-			host, port = parts[0], parts[1]
+			host, port, label = parts[0], parts[1], parts[2]
 		case 4:
 			host, port = parts[0], parts[1]
 			rest = parts[2] + ":" + parts[3] + "@"
 		default:
 			continue
+		}
+		if want != "" {
+			if label == "" || !strings.Contains(strings.ToLower(label), want) {
+				continue
+			}
 		}
 		if host == "" || port == "" {
 			continue
@@ -249,10 +263,104 @@ func parseProxyLines(body, defaultProtocol string) []string {
 	return out
 }
 
+// gateProbeConfig is what an inference probe needs: the Responses
+// endpoint, one free model id and the credential to send.
+type gateProbeConfig struct {
+	URL   string
+	Model string
+	Key   string
+}
+
+// responsesURL derives the Responses endpoint from a models test URL.
+func responsesURL(testURL string) string {
+	u := strings.TrimSuffix(strings.TrimSpace(testURL), "/")
+	for _, suffix := range []string{"/v1/models", "/models"} {
+		if strings.HasSuffix(u, suffix) {
+			return strings.TrimSuffix(u, suffix) + strings.Replace(suffix, "models", "responses", 1)
+		}
+	}
+	return u
+}
+
+// gateProbe sends one minimal genuine-shaped inference request through tr.
+// The free-tier gate rejects most public proxy egress IPs with 403
+// FreeTierError even when the node reaches the API, so a reachability
+// check alone admits nodes that can never serve a completion. Only a 2xx
+// proves this egress is usable.
+func gateProbe(ctx context.Context, tr *http.Transport, cfg *gateProbeConfig, timeout time.Duration) error {
+	if cfg == nil || cfg.Model == "" || cfg.URL == "" {
+		return fmt.Errorf("gate probe not configured")
+	}
+	session := FreshSessionID()
+	body := map[string]any{
+		"model":             cfg.Model,
+		"stream":            true,
+		"instructions":      "You are OpenCode, a coding agent. Reply with the single word ok.",
+		"input":             []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Reply with the single word ok"}}}},
+		"max_output_tokens": 16,
+		"store":             false,
+		"prompt_cache_key":  session,
+		"include":           []any{"reasoning.encrypted_content"},
+	}
+	ensureTools(body, ProtoResponses)
+	raw, err := marshalNoEscape(body)
+	if err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "POST", cfg.URL, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	key := cfg.Key
+	if key == "" {
+		key = "public"
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("Authorization", "Bearer "+key)
+	for _, name := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id", "X-Session-Id"} {
+		req.Header.Set(name, session)
+	}
+	req.Header.Set("x-opencode-project", CanonicalProjectID("session:"+session))
+	req.Header.Set("x-opencode-client", defaultClient)
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+	switch {
+	case resp.StatusCode/100 == 2:
+		return nil
+	case resp.StatusCode == http.StatusForbidden:
+		// The gate's definitive verdict on this egress IP.
+		return fmt.Errorf("gate rejected egress (403): %s", truncateText(string(head), 120))
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("gate probe rate limited (429): %s", truncateText(string(head), 120))
+	default:
+		// Anything else is inconclusive (transient upstream or model
+		// churn), so reachability already proved this node is worth
+		// keeping rather than discarding it on our own probe's failure.
+		return nil
+	}
+}
+
+func truncateText(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 // checkProxyList probes every candidate concurrently and returns the live
 // ones sorted by latency, plus tested/rejected counts. Rejected entries
 // are logged at debug level only (a fresh list typically has many dead).
-func checkProxyList(ctx context.Context, candidates []string, src ProxySource) (live []*proxyTransport, tested, dead int) {
+func checkProxyList(ctx context.Context, candidates []string, src ProxySource, gate *gateProbeConfig) (live []*proxyTransport, tested, dead int) {
 	type result struct {
 		transport *proxyTransport
 		latency   time.Duration
@@ -260,6 +368,10 @@ func checkProxyList(ctx context.Context, candidates []string, src ProxySource) (
 	work := make(chan string)
 	results := make(chan result, len(candidates))
 	timeout := time.Duration(src.TimeoutSeconds) * time.Second
+	gateTimeout := timeout * 2
+	if gateTimeout < 15*time.Second {
+		gateTimeout = 15 * time.Second
+	}
 
 	var wg sync.WaitGroup
 	workers := src.Concurrency
@@ -284,6 +396,17 @@ func checkProxyList(ctx context.Context, candidates []string, src ProxySource) (
 					closeIdle(tr)
 					results <- result{}
 					continue
+				}
+				if src.Probe == "inference" && gate != nil {
+					g := *gate
+					if g.URL == "" {
+						g.URL = responsesURL(src.TestURL)
+					}
+					if err := gateProbe(ctx, tr, &g, gateTimeout); err != nil {
+						closeIdle(tr)
+						results <- result{}
+						continue
+					}
 				}
 				results <- result{
 					transport: &proxyTransport{

@@ -38,7 +38,9 @@ OpenCode 客户端同一份能力目录把每个模型路由到它的**原生协
   钉死 HTTP/1.1
 - **订阅池**：`proxy_sources` 指向纯文本代理列表；每个源在启动时拉取、
   并发测活、只收录活节点（可定时刷新），死节点永不进入轮转。公开列表与
-  私有订阅都支持；每个源可单独配置协议、超时、并发、保留上限与刷新间隔
+  私有订阅都支持；每个源可单独配置协议、国家过滤、测活模式、超时、并发、
+  保留上限与刷新间隔。`probe: "inference"` 还会对每个节点发一次最小补全，
+  因为免费层门禁会把大部分公共代理出口 IP 直接 403 拒绝——即使它们能连通。
 - **空回拦截**：无文本、无工具调用的 2xx 一律不透传，内部换新连接重发；
   且保持实时流式——只扣留前缀，一旦出现真实内容（或超过扣留时限）立即
   冲刷并转为实时透传，客户端能及时收到首个事件
@@ -127,7 +129,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `prefer_direct` | `true` | 优先本机出口，429/5xx/传输失败时切池 |
 | `direct_cooldown_seconds` | `120` | 429 后直连冷却多久（更大的 `Retry-After` 优先） |
 | `pool_max_attempts` | `3` | 每个请求在池内重试几次（每次都是新连接） |
-| `proxy_sources` | `[]` | 订阅 URL（每行一个代理）；每个源启动时拉取+并发测活（阻塞，最多 3 分钟），只收录活节点。行格式支持 `scheme://host:port`、`host:port`、`host:port:国家`、`ip:port:user:pass` |
+| `proxy_sources` | `[]` | 订阅 URL（每行一个代理）；每个源启动时拉取+并发测活（阻塞，最多 3 分钟），只收录活节点。行格式支持 `scheme://host:port`、`host:port`、`host:port:国家`、`ip:port:user:pass`。每个源可配 `protocol`、`country`（只保留国家标签匹配的行）、`probe`（`models`=只测连通，`inference`=再发一次最小补全，被免费层门禁拒绝的节点直接丢弃）、`test_url`、`timeout_seconds`、`concurrency`、`max_keep`、`refresh_hours` |
 | `retry_empty` | `true` | 空 2xx 不透传，内部重发 |
 | `max_empty_retries` | `2` | 空回的额外内部尝试次数（用完仍把最后一次透传） |
 | `empty_guard_timeout_seconds` | `30` | 流式回包在"判定是否为空"期间最多被扣留多久；超时即冲刷已扣留的前缀并转为实时流（`0` = 等到出现内容或流结束） |

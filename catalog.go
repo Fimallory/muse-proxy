@@ -183,6 +183,23 @@ func (c *catalog) freeModelNames() []string {
 	return names
 }
 
+// firstFreeModel returns one real free model id, sorted for determinism,
+// or "" when the free set is unknown. The egress gate probe uses it so a
+// proxy check never spends a paid model.
+func (c *catalog) firstFreeModel() string {
+	c.mu.RLock()
+	names := make([]string, 0, len(c.free))
+	for id := range c.free {
+		names = append(names, id)
+	}
+	c.mu.RUnlock()
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
 func (c *catalog) snapshot() (entries int, updated int64, source string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

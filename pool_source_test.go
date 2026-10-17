@@ -35,7 +35,7 @@ func TestParseProxyLines(t *testing.T) {
 		"13.13.13.13:1080:9999",          // numeric third field: no known shape
 	}, "\n")
 
-	got := parseProxyLines(body, "http")
+	got := parseProxyLines(body, "http", "")
 	want := []string{
 		"http://1.1.1.1:8080",
 		"http://2.2.2.2:3128",
@@ -59,7 +59,7 @@ func TestParseProxyLines(t *testing.T) {
 	}
 
 	// A default protocol of socks5 applies only to scheme-less lines.
-	got2 := parseProxyLines("1.2.3.4:1080\nhttp://5.6.7.8:8080", "socks5")
+	got2 := parseProxyLines("1.2.3.4:1080\nhttp://5.6.7.8:8080", "socks5", "")
 	if len(got2) != 2 || got2[0] != "socks5://1.2.3.4:1080" || got2[1] != "http://5.6.7.8:8080" {
 		t.Fatalf("default protocol wrong: %v", got2)
 	}
@@ -99,6 +99,45 @@ func TestProxyPoolMergeSources(t *testing.T) {
 	}
 }
 
+// TestParseProxyLinesCountry: a country filter keeps only labelled lines
+// that match and drops lines whose country cannot be verified.
+func TestParseProxyLinesCountry(t *testing.T) {
+	body := strings.Join([]string{
+		"1.1.1.1:1080:United States",
+		"2.2.2.2:1080:Netherlands",
+		"3.3.3.3:1080",
+		"socks5://4.4.4.4:1080",
+		"5.5.5.5:1080:united states",
+	}, "\n")
+	got := parseProxyLines(body, "socks5", "United States")
+	want := []string{"socks5://1.1.1.1:1080", "socks5://5.5.5.5:1080"}
+	if len(got) != len(want) {
+		t.Fatalf("count mismatch\n got: %v\nwant: %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("entry %d: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestResponsesURL: the gate probe derives the Responses endpoint from
+// the source's models test URL.
+func TestResponsesURL(t *testing.T) {
+	cases := map[string]string{
+		"https://opencode.ai/inference/v1/models":  "https://opencode.ai/inference/v1/responses",
+		"https://opencode.ai/inference/v1/models/": "https://opencode.ai/inference/v1/responses",
+		"https://example.com/models":               "https://example.com/responses",
+		"https://example.com/custom":               "https://example.com/custom",
+	}
+	for in, want := range cases {
+		if got := responsesURL(in); got != want {
+			t.Fatalf("responsesURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestProxyPoolRoundRobin: the rotation cursor spreads requests evenly.
 func TestProxyPoolRoundRobin(t *testing.T) {
 	p := newProxyPool()
 	mk := func(name string) *proxyTransport {
@@ -165,7 +204,7 @@ func TestProxySourceEndToEnd(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	runProxySourceOnce(ctx, cfg.ProxySources[0], pool)
+	runProxySourceOnce(ctx, cfg.ProxySources[0], pool, nil)
 	if elapsed := time.Since(start); elapsed > 25*time.Second {
 		t.Fatalf("check took %s, concurrency not applied", elapsed)
 	}
@@ -197,7 +236,7 @@ func TestWaitProxySourcesPopulatesBeforeReturn(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	waitProxySources(ctx, cfg, pool, 10*time.Second)
+	waitProxySources(ctx, cfg, pool, 10*time.Second, nil)
 	if elapsed := time.Since(start); elapsed > 12*time.Second {
 		t.Fatalf("wait returned too late: %s", elapsed)
 	}
@@ -230,6 +269,16 @@ func TestProxySourceConfigValidation(t *testing.T) {
 	}
 	if _, err := loadConfig(path2); err == nil {
 		t.Fatal("unsupported protocol must be rejected")
+	}
+
+	// Bad probe mode refused.
+	bad3 := base + `,"proxy_sources":[{"url":"https://x/y","probe":"magic"}]}`
+	path2b := dir + "/bad3.json"
+	if err := writeFile(path2b, bad3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path2b); err == nil {
+		t.Fatal("unsupported probe mode must be rejected")
 	}
 
 	// Defaults applied.

@@ -77,6 +77,17 @@ type ProxySource struct {
 	// Empty means derive from each line (lines without a scheme default
 	// to ProtocolDefault, itself "http" when unset).
 	Protocol string `json:"protocol"`
+	// Country keeps only lines carrying a matching trailing label, e.g.
+	// "1.2.3.4:1080:United States" with Country "United States". Lists
+	// without labels cannot be verified, so their lines are dropped when
+	// this is set; use a country-filtered endpoint instead for those.
+	Country string `json:"country"`
+	// Probe selects the health check. "models" (default) only proves the
+	// node can reach the API. "inference" also sends one minimal
+	// completion, because the free-tier gate rejects most public proxy
+	// egress IPs with 403 FreeTierError even when they are reachable —
+	// reachability alone does not make a node usable.
+	Probe string `json:"probe"`
 	// TestURL is fetched through each proxy to prove it works.
 	// Defaults to https://opencode.ai/zen/v1/models.
 	TestURL string `json:"test_url"`
@@ -231,6 +242,10 @@ func loadConfig(path string) (*Config, error) {
 		src.Protocol = strings.ToLower(strings.TrimSpace(src.Protocol))
 		if src.Protocol != "" && !validProxyProtocols[src.Protocol] {
 			return nil, fmt.Errorf("proxy_sources[%d].protocol must be http, https, socks5 or socks5h", i)
+		}
+		src.Probe = strings.ToLower(strings.TrimSpace(src.Probe))
+		if src.Probe != "" && src.Probe != "models" && src.Probe != "inference" {
+			return nil, fmt.Errorf("proxy_sources[%d].probe must be models or inference", i)
 		}
 		src.TestURL = strings.TrimSpace(src.TestURL)
 		if src.TestURL == "" {

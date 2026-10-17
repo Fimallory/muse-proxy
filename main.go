@@ -25,6 +25,22 @@ import (
 
 var version = "dev"
 
+// waitForFreeModels blocks briefly until the catalog knows the free set.
+// The egress gate probe needs a real free model, and the catalog refresh
+// runs in the background, so startup must not race it.
+func waitForFreeModels(cat *catalog, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		if model := cat.firstFreeModel(); model != "" {
+			return model
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfgPath := flag.String("config", "config.json", "path to JSON config file")
@@ -68,8 +84,28 @@ func main() {
 	// Proxy sources are fetched and health-checked before the listener
 	// opens, so the very first real request never walks a dead pool.
 	if len(cfg.ProxySources) > 0 {
+		// The free-tier gate rejects most public proxy egress IPs, so a
+		// source can ask for an inference probe: one minimal completion
+		// per node, using a real free model. The catalog refreshes in the
+		// background, so wait briefly for the free set instead of
+		// silently degrading to a reachability-only check.
+		wantsGate := false
+		for _, src := range cfg.ProxySources {
+			if src.Probe == "inference" {
+				wantsGate = true
+				break
+			}
+		}
+		var gate *gateProbeConfig
+		if wantsGate {
+			if model := waitForFreeModels(cat, 15*time.Second); model != "" {
+				gate = &gateProbeConfig{Model: model, Key: cfg.ZenKey}
+			} else {
+				log.Printf("proxy probe=inference requested but no free model is known; using reachability only")
+			}
+		}
 		log.Printf("checking %d proxy source(s) before startup...", len(cfg.ProxySources))
-		waitProxySources(appCtx, cfg, pool, 3*time.Minute)
+		waitProxySources(appCtx, cfg, pool, 3*time.Minute, gate)
 	}
 
 	go func() {
